@@ -1,5 +1,5 @@
 from opendbc.can.packer import CANPacker
-from selfdrive.car import apply_driver_steer_torque_limits
+from selfdrive.car import apply_std_steer_torque_limits
 from selfdrive.car.subaru import subarucan
 from selfdrive.car.subaru.values import DBC, GLOBAL_GEN2, PREGLOBAL_CARS, CarControllerParams
 
@@ -19,7 +19,7 @@ class CarController:
     self.p = CarControllerParams(CP)
     self.packer = CANPacker(DBC[CP.carFingerprint]['pt'])
 
-  def update(self, CC, CS, now_nanos):
+  def update(self, CC, CS):
     actuators = CC.actuators
     hud_control = CC.hudControl
     pcm_cancel_cmd = CC.cruiseControl.cancel
@@ -34,13 +34,13 @@ class CarController:
       # limits due to driver torque
 
       new_steer = int(round(apply_steer))
-      apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.p)
+      apply_steer = apply_std_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.p)
 
       if not CC.latActive:
         apply_steer = 0
 
       if self.CP.carFingerprint in PREGLOBAL_CARS:
-        can_sends.append(subarucan.create_preglobal_steering_control(self.packer, apply_steer))
+        can_sends.append(subarucan.create_preglobal_steering_control(self.packer, apply_steer, self.frame, self.p.STEER_STEP))
       else:
         can_sends.append(subarucan.create_steering_control(self.packer, apply_steer))
 
@@ -80,7 +80,7 @@ class CarController:
         self.es_dashstatus_cnt = CS.es_dashstatus_msg["COUNTER"]
 
       if self.es_lkas_cnt != CS.es_lkas_msg["COUNTER"]:
-        can_sends.append(subarucan.create_es_lkas(self.packer, CS.es_lkas_msg, CC.enabled, hud_control.visualAlert,
+        can_sends.append(subarucan.create_es_lkas(self.packer, CS.es_lkas_msg, CC.latActive, CS.madsEnabled, hud_control.visualAlert,
                                                   hud_control.leftLaneVisible, hud_control.rightLaneVisible,
                                                   hud_control.leftLaneDepart, hud_control.rightLaneDepart))
         self.es_lkas_cnt = CS.es_lkas_msg["COUNTER"]

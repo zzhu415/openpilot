@@ -1,6 +1,9 @@
 import os
 import subprocess
 from common.basedir import BASEDIR
+from pathlib import Path
+
+CUSTOM_BOOT = "/data/params/d/CustomBootScreen"
 
 
 class Spinner():
@@ -45,8 +48,42 @@ class Spinner():
 
 if __name__ == "__main__":
   import time
-  with Spinner() as s:
-    s.update("Spinner text")
+  custom_boot = Path(CUSTOM_BOOT)
+  if custom_boot.is_file():
+    with open(CUSTOM_BOOT) as f:
+      if '1' in f.read():
+        with Spinner() as s:
+          s.update("S")
+          time.sleep(1.0)
+          s.update("SU")
+          time.sleep(0.3)
+          s.update("SUN")
+          time.sleep(0.3)
+          s.update("SUNN")
+          time.sleep(0.3)
+          s.update("SUNNY")
+          time.sleep(0.3)
+          s.update("SUNNYP")
+          time.sleep(0.3)
+          s.update("SUNNYPI")
+          time.sleep(0.3)
+          s.update("SUNNYPIL")
+          time.sleep(0.3)
+          s.update("SUNNYPILO")
+          time.sleep(0.3)
+          s.update("SUNNYPILOT")
+          time.sleep(0.5)
+          s.update("For")
+          time.sleep(0.5)
+          s.update("Your")
+          time.sleep(0.5)
+          s.update("Comfort")
+          time.sleep(1.0)
+          s.update("Now Booting...")
+          time.sleep(2.0)
+  else:
+    with Spinner() as s:
+      s.update("Spinner text")
+      time.sleep(5.0)
+    print("gone")
     time.sleep(5.0)
-  print("gone")
-  time.sleep(5.0)

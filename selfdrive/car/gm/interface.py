@@ -5,8 +5,7 @@ from panda import Panda
 
 from common.conversions import Conversions as CV
 from selfdrive.car import STD_CARGO_KG, create_button_event, scale_tire_stiffness, get_safety_config
-from selfdrive.car.gm.radar_interface import RADAR_HEADER_MSG
-from selfdrive.car.gm.values import CAR, CruiseButtons, CarControllerParams, EV_CAR, CAMERA_ACC_CAR, CanBus
+from selfdrive.car.gm.values import CAR, CruiseButtons, CarControllerParams, EV_CAR, CAMERA_ACC_CAR
 from selfdrive.car.interfaces import CarInterfaceBase
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -49,7 +48,6 @@ class CarInterface(CarInterfaceBase):
     ret.carName = "gm"
     ret.safetyConfigs = [get_safety_config(car.CarParams.SafetyModel.gm)]
     ret.autoResumeSng = False
-    use_off_car_defaults = len(fingerprint[0]) == 0  # Pick sensible carParams during offline doc generation/CI jobs
 
     if candidate in EV_CAR:
       ret.transmissionType = TransmissionType.direct
@@ -65,34 +63,32 @@ class CarInterface(CarInterfaceBase):
     if candidate in CAMERA_ACC_CAR:
       ret.experimentalLongitudinalAvailable = True
       ret.networkLocation = NetworkLocation.fwdCamera
-      ret.radarUnavailable = True  # no radar
+      ret.radarOffCan = True  # no radar
       ret.pcmCruise = True
       ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM
       ret.minEnableSpeed = 5 * CV.KPH_TO_MS
-      ret.minSteerSpeed = 10 * CV.KPH_TO_MS
-
-      # Tuning for experimental long
-      ret.longitudinalTuning.kpV = [2.0, 1.5]
-      ret.longitudinalTuning.kiV = [0.72]
-      ret.stopAccel = -2.0
-      ret.stoppingDecelRate = 2.0  # reach brake quickly after enabling
-      ret.vEgoStopping = 0.25
-      ret.vEgoStarting = 0.25
-      ret.longitudinalActuatorDelayUpperBound = 0.5
 
       if experimental_long:
         ret.pcmCruise = False
         ret.openpilotLongitudinalControl = True
         ret.safetyConfigs[0].safetyParam |= Panda.FLAG_GM_HW_CAM_LONG
 
+        # Tuning
+        ret.longitudinalTuning.kpV = [2.0, 1.5]
+        ret.longitudinalTuning.kiV = [0.72]
+        ret.stopAccel = -2.0
+        ret.stoppingDecelRate = 2.0  # reach brake quickly after enabling
+        ret.vEgoStopping = 0.25
+        ret.vEgoStarting = 0.25
+        ret.longitudinalActuatorDelayUpperBound = 0.5
+
     else:  # ASCM, OBD-II harness
       ret.openpilotLongitudinalControl = True
       ret.networkLocation = NetworkLocation.gateway
-      ret.radarUnavailable = RADAR_HEADER_MSG not in fingerprint[CanBus.OBSTACLE] and not use_off_car_defaults
+      ret.radarOffCan = False
       ret.pcmCruise = False  # stock non-adaptive cruise control is kept off
       # supports stop and go, but initial engage must (conservatively) be above 18mph
       ret.minEnableSpeed = 18 * CV.MPH_TO_MS
-      ret.minSteerSpeed = 7 * CV.MPH_TO_MS
 
       # Tuning
       ret.longitudinalTuning.kpV = [2.4, 1.5]
@@ -101,10 +97,11 @@ class CarInterface(CarInterfaceBase):
     # These cars have been put into dashcam only due to both a lack of users and test coverage.
     # These cars likely still work fine. Once a user confirms each car works and a test route is
     # added to selfdrive/car/tests/routes.py, we can remove it from this list.
-    ret.dashcamOnly = candidate in {CAR.CADILLAC_ATS, CAR.HOLDEN_ASTRA, CAR.MALIBU, CAR.BUICK_REGAL, CAR.EQUINOX} or \
-                      (ret.networkLocation == NetworkLocation.gateway and ret.radarUnavailable)
+    ret.dashcamOnly = candidate in {CAR.CADILLAC_ATS, CAR.HOLDEN_ASTRA, CAR.MALIBU, CAR.BUICK_REGAL, CAR.EQUINOX}
 
     # Start with a baseline tuning for all GM vehicles. Override tuning as needed in each model section below.
+    # Some GMs need some tolerance above 10 kph to avoid a fault
+    ret.minSteerSpeed = 10.1 * CV.KPH_TO_MS
     ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0.], [0.]]
     ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.2], [0.00]]
     ret.lateralTuning.pid.kf = 0.00004   # full torque for 20 deg at 80mph means 0.00007818594
@@ -162,15 +159,6 @@ class CarInterface(CarInterfaceBase):
       ret.steerRatio = 15.3
       ret.centerToFront = ret.wheelbase * 0.5
 
-    elif candidate == CAR.ESCALADE:
-      ret.minEnableSpeed = -1.  # engage speed is decided by pcm
-      ret.mass = 5653. * CV.LB_TO_KG + STD_CARGO_KG  # (5552+5815)/2
-      ret.wheelbase = 2.95  # 116 inches in meters
-      ret.steerRatio = 17.3
-      ret.centerToFront = ret.wheelbase * 0.5
-      ret.longitudinalActuatorDelayUpperBound = 0.5  # large delay to initially start braking
-      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
-
     elif candidate == CAR.ESCALADE_ESV:
       ret.minEnableSpeed = -1.  # engage speed is decided by pcm
       ret.mass = 2739. + STD_CARGO_KG
@@ -186,7 +174,7 @@ class CarInterface(CarInterfaceBase):
       ret.mass = 1669. + STD_CARGO_KG
       ret.wheelbase = 2.63779
       ret.steerRatio = 16.8
-      ret.centerToFront = ret.wheelbase * 0.4
+      ret.centerToFront = 2.15  # measured
       tire_stiffness_factor = 1.0
       ret.steerActuatorDelay = 0.2
       CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
@@ -217,36 +205,98 @@ class CarInterface(CarInterfaceBase):
   def _update(self, c):
     ret = self.CS.update(self.cp, self.cp_cam, self.cp_loopback)
 
+    ret.madsEnabled = self.CS.madsEnabled
+    ret.accEnabled = self.CS.accEnabled
+    ret.leftBlinkerOn = self.CS.leftBlinkerOn
+    ret.rightBlinkerOn = self.CS.rightBlinkerOn
+    ret.belowLaneChangeSpeed = self.CS.belowLaneChangeSpeed
+
+    buttonEvents = []
+
     if self.CS.cruise_buttons != self.CS.prev_cruise_buttons and self.CS.prev_cruise_buttons != CruiseButtons.INIT:
-      buttonEvents = [create_button_event(self.CS.cruise_buttons, self.CS.prev_cruise_buttons, BUTTONS_DICT, CruiseButtons.UNPRESS)]
+      buttonEvents.append(create_button_event(self.CS.cruise_buttons, self.CS.prev_cruise_buttons, BUTTONS_DICT, CruiseButtons.UNPRESS))
       # Handle ACCButtons changing buttons mid-press
       if self.CS.cruise_buttons != CruiseButtons.UNPRESS and self.CS.prev_cruise_buttons != CruiseButtons.UNPRESS:
         buttonEvents.append(create_button_event(CruiseButtons.UNPRESS, self.CS.prev_cruise_buttons, BUTTONS_DICT, CruiseButtons.UNPRESS))
 
-      ret.buttonEvents = buttonEvents
+    # MADS BUTTON
+    if self.CS.out.madsEnabled != self.CS.madsEnabled:
+      be = car.CarState.ButtonEvent.new_message()
+      be.pressed = True
+      be.type = ButtonType.altButton1
+      buttonEvents.append(be)
+
+    ret.buttonEvents = buttonEvents
 
     # The ECM allows enabling on falling edge of set, but only rising edge of resume
     events = self.create_common_events(ret, extra_gears=[GearShifter.sport, GearShifter.low,
                                                          GearShifter.eco, GearShifter.manumatic],
-                                       pcm_enable=self.CP.pcmCruise, enable_buttons=(ButtonType.decelCruise,))
-    if not self.CP.pcmCruise:
-      if any(b.type == ButtonType.accelCruise and b.pressed for b in ret.buttonEvents):
-        events.add(EventName.buttonEnable)
+                                       pcm_enable=False, enable_buttons=(ButtonType.decelCruise,))
 
     # Enabling at a standstill with brake is allowed
     # TODO: verify 17 Volt can enable for the first time at a stop and allow for all GMs
     below_min_enable_speed = ret.vEgo < self.CP.minEnableSpeed or self.CS.moving_backward
     if below_min_enable_speed and not (ret.standstill and ret.brake >= 20 and
-                                       self.CP.networkLocation == NetworkLocation.fwdCamera):
+                                       self.CP.networkLocation == NetworkLocation.fwdCamera) and \
+                                       ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled and \
+                                       not self.CS.madsEnabled:
       events.add(EventName.belowEngageSpeed)
     if ret.cruiseState.standstill:
       events.add(EventName.resumeRequired)
-    if ret.vEgo < self.CP.minSteerSpeed:
+    if ret.vEgo < self.CP.minSteerSpeed and self.CS.madsEnabled:
       events.add(EventName.belowSteerSpeed)
+
+    self.CS.disengageByBrake = self.CS.disengageByBrake or ret.disengageByBrake
+
+    enable_pressed = False
+    enable_from_brake = False
+
+    if self.CS.disengageByBrake and not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake and self.CS.madsEnabled:
+      enable_pressed = True
+      enable_from_brake = True
+
+    if not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake:
+      self.CS.disengageByBrake = False
+      ret.disengageByBrake = False
+
+    if self.CP.pcmCruise:
+      # do enable on both accel and decel buttons
+      if ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled:
+        enable_pressed = True
+
+    for b in ret.buttonEvents:
+      # do disable on button down
+      if b.type == ButtonType.cancel:
+        if not self.CS.madsEnabled:
+          events.add(EventName.buttonCancel)
+        elif not self.cruise_cancelled_btn:
+          self.cruise_cancelled_btn = True
+          events.add(EventName.manualLongitudinalRequired)
+      # do enable on both accel and decel buttons
+      if (b.type == ButtonType.accelCruise and b.pressed) or (b.type == ButtonType.decelCruise and not b.pressed) and not self.CP.pcmCruise:
+        enable_pressed = self.CS.resumeAllowed
+      # do disable on MADS button if ACC is disabled
+      if b.type == ButtonType.altButton1 and b.pressed:
+        if not self.CS.madsEnabled: # disabled MADS
+          if not ret.cruiseState.enabled:
+            events.add(EventName.buttonCancel)
+          else:
+            events.add(EventName.manualSteeringRequired)
+        else: # enabled MADS
+          if not ret.cruiseState.enabled:
+            enable_pressed = True
+    if (ret.cruiseState.enabled or self.CS.madsEnabled) and enable_pressed:
+      if enable_from_brake:
+        events.add(EventName.silentButtonEnable)
+      else:
+        events.add(EventName.buttonEnable)
+
+    if ret.cruiseState.enabled:
+      self.cruise_cancelled_btn = False
 
     ret.events = events.to_msg()
 
     return ret
 
-  def apply(self, c, now_nanos):
-    return self.CC.update(c, self.CS, now_nanos)
+  def apply(self, c):
+    return self.CC.update(c, self.CS)

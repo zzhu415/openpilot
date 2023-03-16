@@ -2,9 +2,11 @@ import copy
 from cereal import car
 from opendbc.can.can_define import CANDefine
 from common.conversions import Conversions as CV
+from common.params import Params
 from selfdrive.car.interfaces import CarStateBase
 from opendbc.can.parser import CANParser
 from selfdrive.car.subaru.values import DBC, CAR, GLOBAL_GEN2, PREGLOBAL_CARS
+from selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
 
 
 class CarState(CarStateBase):
@@ -13,8 +15,35 @@ class CarState(CarStateBase):
     can_define = CANDefine(DBC[CP.carFingerprint]["pt"])
     self.shifter_values = can_define.dv["Transmission"]["Gear"]
 
+    self.param_s = Params()
+    self.enable_mads = self.param_s.get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = self.param_s.get_bool("DisengageLateralOnBrake")
+    self.acc_mads_combo = self.param_s.get_bool("AccMadsCombo")
+    self.below_speed_pause = self.param_s.get_bool("BelowSpeedPause")
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
+    self.accEnabled = False
+    self.madsEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+    self.mads_enabled = False
+    self.prev_mads_enabled = False
+    self.lkas_enabled = None
+    self.prev_lkas_enabled = None
+    self.cruiseState_enabled = False
+    self.prev_cruiseState_enabled = False
+    self.prev_acc_mads_combo = False
+    self.prev_brake_pressed = False
+
   def update(self, cp, cp_cam, cp_body):
     ret = car.CarState.new_message()
+
+    # update prevs, update must run once per loop
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_lkas_enabled = self.lkas_enabled
+    self.prev_cruiseState_enabled = self.cruiseState_enabled
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
 
     ret.gas = cp.vl["Throttle"]["Throttle_Pedal"] / 255.
     ret.gasPressed = ret.gas > 1e-5
@@ -23,6 +52,11 @@ class CarState(CarStateBase):
     else:
       cp_brakes = cp_body if self.car_fingerprint in GLOBAL_GEN2 else cp
       ret.brakePressed = cp_brakes.vl["Brake_Status"]["Brake"] == 1
+
+    if self.car_fingerprint in PREGLOBAL_CARS:
+      ret.brakeLights = bool(cp_cam.vl["ES_Brake"]["Brake_Light"] or ret.brakePressed)
+    else:
+      ret.brakeLights = bool(cp_cam.vl["ES_DashStatus"]["Brake_Lights"] or ret.brakePressed)
 
     cp_wheels = cp_body if self.car_fingerprint in GLOBAL_GEN2 else cp
     ret.wheelSpeeds = self.get_wheel_speeds(
@@ -35,9 +69,20 @@ class CarState(CarStateBase):
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
     ret.standstill = ret.vEgoRaw == 0
 
+    self.belowLaneChangeSpeed = ret.vEgo < LANE_CHANGE_SPEED_MIN and self.below_speed_pause
+
+    if self.car_fingerprint not in PREGLOBAL_CARS:
+      self.lkas_enabled = cp_cam.vl["ES_LKAS_State"]["LKAS_Dash_State"]
+
+    if self.prev_lkas_enabled is None:
+      self.prev_lkas_enabled = self.lkas_enabled
+
     # continuous blinker signals for assisted lane change
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["Dashlights"]["LEFT_BLINKER"],
                                                                           cp.vl["Dashlights"]["RIGHT_BLINKER"])
+
+    self.leftBlinkerOn = cp.vl["Dashlights"]["LEFT_BLINKER"] != 0
+    self.rightBlinkerOn = cp.vl["Dashlights"]["RIGHT_BLINKER"] != 0
 
     if self.CP.enableBsm:
       ret.leftBlindspot = (cp.vl["BSD_RCTA"]["L_ADJACENT"] == 1) or (cp.vl["BSD_RCTA"]["L_APPROACHING"] == 1)
@@ -54,30 +99,73 @@ class CarState(CarStateBase):
     ret.steeringPressed = abs(ret.steeringTorque) > steer_threshold
 
     cp_cruise = cp_body if self.car_fingerprint in GLOBAL_GEN2 else cp
-    ret.cruiseState.enabled = cp_cruise.vl["CruiseControl"]["Cruise_Activated"] != 0
+    ret.cruiseState.enabled = self.cruiseState_enabled = cp_cruise.vl["CruiseControl"]["Cruise_Activated"] != 0
     ret.cruiseState.available = cp_cruise.vl["CruiseControl"]["Cruise_On"] != 0
     ret.cruiseState.speed = cp_cam.vl["ES_DashStatus"]["Cruise_Set_Speed"] * CV.KPH_TO_MS
+
+    self.mads_enabled = ret.cruiseState.available
 
     if (self.car_fingerprint in PREGLOBAL_CARS and cp.vl["Dash_State2"]["UNITS"] == 1) or \
        (self.car_fingerprint not in PREGLOBAL_CARS and cp.vl["Dashlights"]["UNITS"] == 1):
       ret.cruiseState.speed *= CV.MPH_TO_KPH
+
+    if ret.cruiseState.available:
+      if self.enable_mads:
+        if not self.prev_mads_enabled and self.mads_enabled:
+          self.madsEnabled = True
+        if self.car_fingerprint not in PREGLOBAL_CARS:
+          if self.prev_lkas_enabled != self.lkas_enabled and self.lkas_enabled != 2 and not (self.prev_lkas_enabled == 2 and self.lkas_enabled == 1):
+            self.madsEnabled = not self.madsEnabled
+          elif self.prev_lkas_enabled != self.lkas_enabled and self.prev_lkas_enabled == 2 and self.lkas_enabled != 1:
+            self.madsEnabled = not self.madsEnabled
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and (ret.cruiseState.enabled or self.accEnabled):
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled or self.accEnabled
+    else:
+      self.madsEnabled = False
+
+    ret.endToEndLong = self.e2eLongStatus
+
+    if self.prev_cruiseState_enabled: # CANCEL
+      if not ret.cruiseState.enabled:
+        if not self.enable_mads:
+          self.madsEnabled = False
+    if ret.brakePressed and (not self.prev_brake_pressed or not ret.standstill):
+      if not self.enable_mads:
+        self.madsEnabled = False
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+      elif not ret.cruiseState.enabled and self.prev_cruiseState_enabled:
+        self.madsEnabled = False
+    self.prev_brake_pressed = ret.brakePressed
 
     ret.seatbeltUnlatched = cp.vl["Dashlights"]["SEATBELT_FL"] == 1
     ret.doorOpen = any([cp.vl["BodyInfo"]["DOOR_OPEN_RR"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_RL"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FR"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FL"]])
-    ret.steerFaultPermanent = cp.vl["Steering_Torque"]["Steer_Error_1"] == 1
 
     if self.car_fingerprint in PREGLOBAL_CARS:
       self.cruise_button = cp_cam.vl["ES_Distance"]["Cruise_Button"]
       self.ready = not cp_cam.vl["ES_DashStatus"]["Not_Ready_Startup"]
     else:
-      ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
       ret.cruiseState.nonAdaptive = cp_cam.vl["ES_DashStatus"]["Conventional_Cruise"] == 1
       ret.cruiseState.standstill = cp_cam.vl["ES_DashStatus"]["Cruise_State"] == 3
       ret.stockFcw = cp_cam.vl["ES_LKAS_State"]["LKAS_Alert"] == 2
       self.es_lkas_msg = copy.copy(cp_cam.vl["ES_LKAS_State"])
+
+    ret.steerFaultTemporary = False
+    ret.steerFaultPermanent = False
+
+    if self.madsEnabled:
+      if (not self.belowLaneChangeSpeed and (self.leftBlinkerOn or self.rightBlinkerOn)) or\
+        not (self.leftBlinkerOn or self.rightBlinkerOn):
+        ret.steerFaultPermanent = cp.vl["Steering_Torque"]["Steer_Error_1"] == 1
+        if self.car_fingerprint not in PREGLOBAL_CARS:
+          ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
 
     cp_es_distance = cp_body if self.car_fingerprint in GLOBAL_GEN2 else cp_cam
     self.es_distance_msg = copy.copy(cp_es_distance.vl["ES_Distance"])
@@ -240,11 +328,13 @@ class CarState(CarStateBase):
         ("Signal6", "ES_Distance"),
         ("Cruise_Button", "ES_Distance"),
         ("Signal7", "ES_Distance"),
+        ("Brake_Light", "ES_Brake"),
       ]
 
       checks = [
         ("ES_DashStatus", 20),
         ("ES_Distance", 20),
+        ("ES_Brake", 20),
       ]
     else:
       signals = [

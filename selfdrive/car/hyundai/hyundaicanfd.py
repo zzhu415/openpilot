@@ -14,7 +14,7 @@ def create_steering_messages(packer, CP, enabled, lat_active, apply_steer):
 
   values = {
     "LKA_MODE": 2,
-    "LKA_ICON": 2 if enabled else 1,
+    "LKA_ICON": 2 if lat_active else 1,
     "TORQUE_REQUEST": apply_steer,
     "LKA_ASSIST": 0,
     "STEER_REQ": 1 if lat_active else 0,
@@ -56,10 +56,10 @@ def create_acc_cancel(packer, CP, cruise_info_copy):
   })
   return packer.make_can_msg("SCC_CONTROL", get_e_can_bus(CP), values)
 
-def create_lfahda_cluster(packer, CP, enabled):
+def create_lfahda_cluster(packer, CP, enabled, lat_active, mads_enabled):
   values = {
     "HDA_ICON": 1 if enabled else 0,
-    "LFA_ICON": 2 if enabled else 0,
+    "LFA_ICON": 2 if lat_active else 1 if not lat_active and mads_enabled else 0,
   }
   return packer.make_can_msg("LFAHDA_CLUSTER", get_e_can_bus(CP), values)
 
@@ -72,6 +72,8 @@ def create_acc_control(packer, CP, enabled, accel_last, accel, stopping, gas_ove
   else:
     a_raw = accel
     a_val = clip(accel, accel_last - jn, accel_last + jn)
+    if stopping:
+      a_raw = 0
 
   values = {
     "ACCMode": 0 if not enabled else (2 if gas_override else 1),
@@ -81,7 +83,6 @@ def create_acc_control(packer, CP, enabled, accel_last, accel, stopping, gas_ove
     "aReqRaw": a_raw,
     "VSetDis": set_speed,
     "JerkLowerLimit": jerk if enabled else 1,
-    "JerkUpperLimit": 3.0,
 
     "ACC_ObjDist": 1,
     "ObjValid": 0,
@@ -89,6 +90,7 @@ def create_acc_control(packer, CP, enabled, accel_last, accel, stopping, gas_ove
     "SET_ME_2": 0x4,
     "SET_ME_3": 0x3,
     "SET_ME_TMP_64": 0x64,
+    "NEW_SIGNAL_10": 4,
     "DISTANCE_SETTING": 4,
   }
 

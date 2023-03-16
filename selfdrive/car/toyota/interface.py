@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 from cereal import car
 from common.conversions import Conversions as CV
+from common.params import Params
 from panda import Panda
-from selfdrive.car.toyota.values import Ecu, CAR, ToyotaFlags, TSS2_CAR, RADAR_ACC_CAR, NO_DSU_CAR, MIN_ACC_SPEED, EPS_SCALE, EV_HYBRID_CAR, UNSUPPORTED_DSU_CAR, CarControllerParams, NO_STOP_TIMER_CAR
+from common.numpy_fast import interp
+from selfdrive.car.toyota.values import Ecu, CAR, ToyotaFlags, TSS2_CAR, RADAR_ACC_CAR, NO_DSU_CAR, MIN_ACC_SPEED, EPS_SCALE, EV_HYBRID_CAR, UNSUPPORTED_DSU_CAR, CarControllerParams, NO_STOP_TIMER_CAR, FEATURES
 from selfdrive.car import STD_CARGO_KG, scale_tire_stiffness, get_safety_config
 from selfdrive.car.interfaces import CarInterfaceBase
 
+ButtonType = car.CarState.ButtonEvent.Type
 EventName = car.CarEvent.EventName
+GearShifter = car.CarState.GearShifter
 
 
 class CarInterface(CarInterfaceBase):
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
-    return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
+    if CP.carFingerprint in TSS2_CAR:
+      # Allow for higher accel from PID controller at low speeds
+      return CarControllerParams.ACCEL_MIN, interp(current_speed,
+                                                   CarControllerParams.ACCEL_MAX_TSS2_BP,
+                                                   CarControllerParams.ACCEL_MAX_TSS2_VALS)
+    else:
+      return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
 
   @staticmethod
   def _get_params(ret, candidate, fingerprint, car_fw, experimental_long):
@@ -72,7 +82,7 @@ class CarInterface(CarInterfaceBase):
       tire_stiffness_factor = 0.5533
       ret.mass = 4481. * CV.LB_TO_KG + STD_CARGO_KG  # mean between min and max
 
-    elif candidate in (CAR.CHR, CAR.CHRH, CAR.CHR_TSS2, CAR.CHRH_TSS2):
+    elif candidate in (CAR.CHR, CAR.CHRH):
       stop_and_go = True
       ret.wheelbase = 2.63906
       ret.steerRatio = 13.6
@@ -186,6 +196,9 @@ class CarInterface(CarInterfaceBase):
       tire_stiffness_factor = 0.444
       ret.mass = 4305. * CV.LB_TO_KG + STD_CARGO_KG
 
+    if Params().get_bool("EnforceTorqueLateral"):
+      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning, steering_angle_deadzone_deg)
+
     ret.centerToFront = ret.wheelbase * 0.44
 
     # TODO: start from empirically derived lateral slip stiffness for the civic and scale by
@@ -196,12 +209,14 @@ class CarInterface(CarInterfaceBase):
     ret.enableBsm = 0x3F6 in fingerprint[0] and candidate in TSS2_CAR
     # Detect smartDSU, which intercepts ACC_CMD from the DSU allowing openpilot to send it
     smartDsu = 0x2FF in fingerprint[0]
+    if smartDsu:
+      ret.flags |= ToyotaFlags.SMART_DSU.value
     # In TSS2 cars the camera does long control
     found_ecus = [fw.ecu for fw in car_fw]
     ret.enableDsu = len(found_ecus) > 0 and Ecu.dsu not in found_ecus and candidate not in (NO_DSU_CAR | UNSUPPORTED_DSU_CAR) and not smartDsu
     ret.enableGasInterceptor = 0x201 in fingerprint[0]
     # if the smartDSU is detected, openpilot can send ACC_CMD (and the smartDSU will block it from the DSU) or not (the DSU is "connected")
-    ret.openpilotLongitudinalControl = smartDsu or ret.enableDsu or candidate in (TSS2_CAR - RADAR_ACC_CAR)
+    ret.openpilotLongitudinalControl = (smartDsu or ret.enableDsu or candidate in (TSS2_CAR - RADAR_ACC_CAR)) and not Params().get_bool("StockLongToyota")
     ret.autoResumeSng = ret.openpilotLongitudinalControl and candidate in NO_STOP_TIMER_CAR
 
     if not ret.openpilotLongitudinalControl:
@@ -234,14 +249,35 @@ class CarInterface(CarInterfaceBase):
       tune.kpV = [3.6, 2.4, 1.5]
       tune.kiV = [0.54, 0.36]
 
+    if candidate in FEATURES["use_lta_msg"]:
+      ret.safetyConfigs[0].safetyParam |= Panda.FLAG_TOYOTA_MADS_LTA_MSG
+
     return ret
 
   # returns a car.CarState
   def _update(self, c):
     ret = self.CS.update(self.cp, self.cp_cam)
 
+    ret.madsEnabled = self.CS.madsEnabled
+    ret.accEnabled = self.CS.accEnabled
+    ret.leftBlinkerOn = self.CS.leftBlinkerOn
+    ret.rightBlinkerOn = self.CS.rightBlinkerOn
+    ret.belowLaneChangeSpeed = self.CS.belowLaneChangeSpeed
+
+    buttonEvents = []
+
+    # MADS BUTTON
+    if self.CS.out.madsEnabled != self.CS.madsEnabled:
+      be = car.CarState.ButtonEvent.new_message()
+      be.pressed = True
+      be.type = ButtonType.altButton1
+      buttonEvents.append(be)
+
+    ret.buttonEvents = buttonEvents
+
     # events
-    events = self.create_common_events(ret)
+    events = self.create_common_events(ret, extra_gears=[GearShifter.sport, GearShifter.low, GearShifter.brake],
+                                       pcm_enable=False)
 
     if self.CP.openpilotLongitudinalControl:
       if ret.cruiseState.standstill and not ret.brakePressed and not self.CP.enableGasInterceptor:
@@ -257,11 +293,57 @@ class CarInterface(CarInterfaceBase):
           # while in standstill, send a user alert
           events.add(EventName.manualRestart)
 
+    self.CS.disengageByBrake = self.CS.disengageByBrake or ret.disengageByBrake
+
+    enable_pressed = False
+    enable_from_brake = False
+
+    if self.CS.disengageByBrake and not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake and self.CS.madsEnabled:
+      enable_pressed = True
+      enable_from_brake = True
+
+    if not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake:
+      self.CS.disengageByBrake = False
+      ret.disengageByBrake = False
+
+    if self.CP.pcmCruise:
+      # do disable on button down
+      if not ret.cruiseState.enabled and self.CS.out.cruiseState.enabled:
+        if not self.CS.madsEnabled:
+          events.add(EventName.buttonCancel)
+        elif not self.cruise_cancelled_btn:
+          self.cruise_cancelled_btn = True
+          events.add(EventName.manualLongitudinalRequired)
+      # do enable on both accel and decel buttons
+      if ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled:
+        enable_pressed = True
+
+    # handle button presses
+    for b in ret.buttonEvents:
+      # do disable on MADS button if ACC is disabled
+      if b.type == ButtonType.altButton1 and b.pressed:
+        if not self.CS.madsEnabled: # disabled MADS
+          if not ret.cruiseState.enabled:
+            events.add(EventName.buttonCancel)
+          else:
+            events.add(EventName.manualSteeringRequired)
+        else: # enabled MADS
+          if not ret.cruiseState.enabled:
+            enable_pressed = True
+    if (ret.cruiseState.enabled or self.CS.madsEnabled) and enable_pressed:
+      if enable_from_brake:
+        events.add(EventName.silentButtonEnable)
+      else:
+        events.add(EventName.buttonEnable)
+
+    if ret.cruiseState.enabled:
+      self.cruise_cancelled_btn = False
+
     ret.events = events.to_msg()
 
     return ret
 
   # pass in a car.CarControl
   # to be called @ 100hz
-  def apply(self, c, now_nanos):
-    return self.CC.update(c, self.CS, now_nanos)
+  def apply(self, c):
+    return self.CC.update(c, self.CS)

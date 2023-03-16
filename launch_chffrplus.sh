@@ -74,7 +74,7 @@ function launch {
 
   # handle pythonpath
   ln -sfn $(pwd) /data/pythonpath
-  export PYTHONPATH="$PWD"
+  export PYTHONPATH="$PWD:$PWD/pyextra"
 
   # hardware specific init
   agnos_init
@@ -82,9 +82,17 @@ function launch {
   # write tmux scrollback to a file
   tmux capture-pane -pq -S-1000 > /tmp/launch_log
 
+  if [ -f "$BASEDIR/customboot" ]; then
+    python /data/openpilot/common/spinner.py &
+  fi
+
   # start manager
   cd selfdrive/manager
-  ./build.py && ./manager.py
+  if [ ! -f "/data/params/d/OsmLocal" ]; then
+    ./custom_dep.py && ./build.py && ./manager.py
+  else
+    ./custom_dep.py && ./build.py && ./local_osm_install.py && ./manager.py
+  fi
 
   # if broken, keep on screen error
   while true; do sleep 1; done

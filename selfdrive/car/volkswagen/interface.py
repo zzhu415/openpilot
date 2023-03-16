@@ -1,9 +1,11 @@
 from cereal import car
 from panda import Panda
 from common.conversions import Conversions as CV
+from common.params import Params
 from selfdrive.car import STD_CARGO_KG, get_safety_config
 from selfdrive.car.interfaces import CarInterfaceBase
-from selfdrive.car.volkswagen.values import CAR, PQ_CARS, CANBUS, NetworkLocation, TransmissionType, GearShifter
+from selfdrive.car.volkswagen.values import CAR, PQ_CARS, CANBUS, NetworkLocation, TransmissionType, GearShifter, CarControllerParams, \
+                                            BUTTON_STATES
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = car.CarEvent.EventName
@@ -20,10 +22,12 @@ class CarInterface(CarInterfaceBase):
       self.ext_bus = CANBUS.cam
       self.cp_ext = self.cp_cam
 
+    self.buttonStatesPrev = BUTTON_STATES.copy()
+
   @staticmethod
   def _get_params(ret, candidate, fingerprint, car_fw, experimental_long):
     ret.carName = "volkswagen"
-    ret.radarUnavailable = True
+    ret.radarOffCan = True
 
     use_off_car_defaults = len(fingerprint[0]) == 0  # Pick sensible carParams during offline doc generation/CI jobs
 
@@ -89,6 +93,10 @@ class CarInterface(CarInterfaceBase):
         ret.minEnableSpeed = 4.5
 
     ret.pcmCruise = not ret.openpilotLongitudinalControl
+    ret.customStockLongAvailable = True
+    ret.pcmCruiseSpeed = False if (Params().get_bool("SpeedLimitControl") or Params().get_bool("TurnVisionControl") or
+                                   Params().get_bool("TurnSpeedControl")) and not ret.openpilotLongitudinalControl and \
+                                  Params().get_bool("CustomStockLong") and ret.customStockLongAvailable else True
     ret.stoppingControl = True
     ret.startingState = True
     ret.startAccel = 1.0
@@ -106,11 +114,6 @@ class CarInterface(CarInterfaceBase):
     elif candidate == CAR.ATLAS_MK1:
       ret.mass = 2011 + STD_CARGO_KG
       ret.wheelbase = 2.98
-
-    elif candidate == CAR.CRAFTER_MK2:
-      ret.mass = 2100 + STD_CARGO_KG
-      ret.wheelbase = 3.64  # SWB, LWB is 4.49, TBD how to detect difference
-      ret.minSteerSpeed = 50 * CV.KPH_TO_MS
 
     elif candidate == CAR.GOLF_MK7:
       ret.mass = 1397 + STD_CARGO_KG
@@ -187,10 +190,6 @@ class CarInterface(CarInterfaceBase):
       ret.mass = 1227 + STD_CARGO_KG
       ret.wheelbase = 2.64
 
-    elif candidate == CAR.SKODA_FABIA_MK4:
-      ret.mass = 1266 + STD_CARGO_KG
-      ret.wheelbase = 2.56
-
     elif candidate == CAR.SKODA_KAMIQ_MK1:
       ret.mass = 1265 + STD_CARGO_KG
       ret.wheelbase = 2.66
@@ -218,6 +217,9 @@ class CarInterface(CarInterfaceBase):
     else:
       raise ValueError(f"unsupported car {candidate}")
 
+    if Params().get_bool("EnforceTorqueLateral"):
+      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
+
     ret.autoResumeSng = ret.minEnableSpeed == -1
     ret.centerToFront = ret.wheelbase * 0.45
     return ret
@@ -226,8 +228,37 @@ class CarInterface(CarInterfaceBase):
   def _update(self, c):
     ret = self.CS.update(self.cp, self.cp_cam, self.cp_ext, self.CP.transmissionType)
 
+    ret.madsEnabled = self.CS.madsEnabled
+    ret.accEnabled = self.CS.accEnabled
+    ret.leftBlinkerOn = self.CS.leftBlinkerOn
+    ret.rightBlinkerOn = self.CS.rightBlinkerOn
+    ret.belowLaneChangeSpeed = self.CS.belowLaneChangeSpeed
+
+    buttonEvents = []
+
+    #for button in self.CS.button_events:
+    #  buttonEvents.append(button)
+
+    # Check for and process state-change events (button press or release) from
+    # the turn stalk switch or ACC steering wheel/control stalk buttons.
+    for button in self.CS.buttonStates:
+      if self.CS.buttonStates[button] != self.buttonStatesPrev[button]:
+        be = car.CarState.ButtonEvent.new_message()
+        be.type = button
+        be.pressed = self.CS.buttonStates[button]
+        buttonEvents.append(be)
+
+    # MADS BUTTON
+    if self.CS.out.madsEnabled != self.CS.madsEnabled:
+      be = car.CarState.ButtonEvent.new_message()
+      be.pressed = True
+      be.type = ButtonType.altButton1
+      buttonEvents.append(be)
+
+    ret.buttonEvents = buttonEvents
+
     events = self.create_common_events(ret, extra_gears=[GearShifter.eco, GearShifter.sport, GearShifter.manumatic],
-                                       pcm_enable=not self.CS.CP.openpilotLongitudinalControl,
+                                       pcm_enable=False,
                                        enable_buttons=(ButtonType.setCruise, ButtonType.resumeCruise))
 
     # Low speed steer alert hysteresis logic
@@ -235,7 +266,7 @@ class CarInterface(CarInterfaceBase):
       self.low_speed_alert = True
     elif ret.vEgo > (self.CP.minSteerSpeed + 2.):
       self.low_speed_alert = False
-    if self.low_speed_alert:
+    if self.low_speed_alert and self.CS.madsEnabled:
       events.add(EventName.belowSteerSpeed)
 
     if self.CS.CP.openpilotLongitudinalControl:
@@ -244,9 +275,63 @@ class CarInterface(CarInterfaceBase):
       if c.enabled and ret.vEgo < self.CP.minEnableSpeed:
         events.add(EventName.speedTooLow)
 
+    self.CS.disengageByBrake = self.CS.disengageByBrake or ret.disengageByBrake
+
+    enable_pressed = False
+    enable_from_brake = False
+
+    if self.CS.disengageByBrake and not ret.brakePressed and not ret.parkingBrake and self.CS.madsEnabled:
+      enable_pressed = True
+      enable_from_brake = True
+
+    if not ret.brakePressed and not ret.parkingBrake:
+      self.CS.disengageByBrake = False
+      ret.disengageByBrake = False
+
+    if self.CP.pcmCruise:
+      # do enable on both accel and decel buttons
+      if ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled:
+        enable_pressed = True
+
+    for b in ret.buttonEvents:
+      # do disable on button down
+      if b.type == ButtonType.cancel:
+        if not self.CS.madsEnabled:
+          events.add(EventName.buttonCancel)
+        elif not self.cruise_cancelled_btn:
+          self.cruise_cancelled_btn = True
+          events.add(EventName.manualLongitudinalRequired)
+      # do enable on both accel and decel buttons
+      if b.type in (ButtonType.setCruise, ButtonType.resumeCruise, ButtonType.accelCruise, ButtonType.decelCruise) and not b.pressed and not self.CP.pcmCruise:
+        enable_pressed = self.CS.resumeAllowed
+      # do disable on MADS button if ACC is disabled
+      if b.type == ButtonType.altButton1 and b.pressed:
+        if not self.CS.madsEnabled: # disabled MADS
+          if not ret.cruiseState.enabled:
+            events.add(EventName.buttonCancel)
+          else:
+            events.add(EventName.manualSteeringRequired)
+        else: # enabled MADS
+          if not ret.cruiseState.enabled:
+            enable_pressed = True
+    if (ret.cruiseState.enabled or self.CS.madsEnabled) and enable_pressed:
+      if enable_from_brake:
+        events.add(EventName.silentButtonEnable)
+      else:
+        events.add(EventName.buttonEnable)
+
+    if ret.cruiseState.enabled:
+      self.cruise_cancelled_btn = False
+
+    self.buttonStatesPrev = self.CS.buttonStates.copy()
+
+    ret.customStockLong = self.CS.update_custom_stock_long(self.CC.cruise_button, self.CC.final_speed_kph,
+                                                           self.CC.v_cruise_kph_prev, self.CC.target_speed,
+                                                           self.CC.v_set_dis, self.CC.speed_diff, self.CC.button_type)
+
     ret.events = events.to_msg()
 
     return ret
 
-  def apply(self, c, now_nanos):
-    return self.CC.update(c, self.CS, self.ext_bus, now_nanos)
+  def apply(self, c):
+    return self.CC.update(c, self.CS, self.ext_bus)

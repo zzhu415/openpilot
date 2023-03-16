@@ -1,12 +1,16 @@
 from cereal import car
+import cereal.messaging as messaging
 from common.numpy_fast import clip, interp
-from selfdrive.car import apply_meas_steer_torque_limits, create_gas_interceptor_command, make_can_msg
+from common.params import Params
+from common.realtime import DT_CTRL
+from selfdrive.car import apply_toyota_steer_torque_limits, create_gas_interceptor_command, make_can_msg
 from selfdrive.car.toyota.toyotacan import create_steer_command, create_ui_command, \
                                            create_accel_command, create_acc_cancel_command, \
-                                           create_fcw_command, create_lta_steer_command
+                                           create_fcw_command, create_lta_steer_command, create_ui_command_disable_startup_lkas
 from selfdrive.car.toyota.values import CAR, STATIC_DSU_MSGS, NO_STOP_TIMER_CAR, TSS2_CAR, \
                                         MIN_ACC_SPEED, PEDAL_TRANSITION, CarControllerParams, \
-                                        UNSUPPORTED_DSU_CAR
+                                        UNSUPPORTED_DSU_CAR, FEATURES
+from selfdrive.car.toyota.interface import CarInterface
 from opendbc.can.packer import CANPacker
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
@@ -28,13 +32,20 @@ class CarController:
     self.alert_active = False
     self.last_standstill = False
     self.standstill_req = False
-    self.steer_rate_counter = 0
 
     self.packer = CANPacker(dbc_name)
     self.gas = 0
     self.accel = 0
 
-  def update(self, CC, CS, now_nanos):
+    self.sm = messaging.SubMaster(['e2eLongState'])
+    self.param_s = Params()
+    self.e2e_long_status = 0
+    self.e2e_long_status_timer = 0
+    self.has_set_lkas = False
+
+  def update(self, CC, CS):
+    self.e2e_long_status = self.sm['e2eLongState'].status
+
     actuators = CC.actuators
     hud_control = CC.hudControl
     pcm_cancel_cmd = CC.cruiseControl.cancel
@@ -56,11 +67,13 @@ class CarController:
       interceptor_gas_cmd = clip(pedal_command, 0., MAX_INTERCEPTOR_GAS)
     else:
       interceptor_gas_cmd = 0.
-    pcm_accel_cmd = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+    pcm_accel_cmd = 0 if not CC.longActive else clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
+    pid_accel_limits = CarInterface.get_pid_accel_limits(self.CP, CS.out.vEgo, None)  # Need to get cruise speed from somewhere
+    pcm_accel_cmd = clip(actuators.accel, pid_accel_limits[0], pid_accel_limits[1])
 
     # steer torque
     new_steer = int(round(actuators.steer * CarControllerParams.STEER_MAX))
-    apply_steer = apply_meas_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, self.torque_rate_limits)
+    apply_steer = apply_toyota_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, self.torque_rate_limits)
 
     # Count up to MAX_STEER_RATE_FRAMES, at which point we need to cut torque to avoid a steering fault
     if lat_active and abs(CS.out.steeringRateDeg) >= MAX_STEER_RATE:
@@ -78,8 +91,8 @@ class CarController:
 
     # TODO: probably can delete this. CS.pcm_acc_status uses a different signal
     # than CS.cruiseState.enabled. confirm they're not meaningfully different
-    if not CC.enabled and CS.pcm_acc_status:
-      pcm_cancel_cmd = 1
+    #if not CC.enabled and CS.pcm_acc_status:
+    #  pcm_cancel_cmd = 1
 
     # on entering standstill, send standstill request
     if CS.out.standstill and not self.last_standstill and (self.CP.carFingerprint not in NO_STOP_TIMER_CAR or self.CP.enableGasInterceptor):
@@ -90,6 +103,13 @@ class CarController:
 
     self.last_steer = apply_steer
     self.last_standstill = CS.out.standstill
+
+    cur_time = self.frame * DT_CTRL
+
+    if self.e2e_long_status != 2:
+      self.e2e_long_status_timer = cur_time
+
+    e2e_long_chime = (self.e2e_long_status == 2 and (0.3 < (cur_time - self.e2e_long_status_timer) <= 0.4)) or self.e2e_long_status == 3
 
     can_sends = []
 
@@ -116,10 +136,10 @@ class CarController:
       if pcm_cancel_cmd and self.CP.carFingerprint in UNSUPPORTED_DSU_CAR:
         can_sends.append(create_acc_cancel_command(self.packer))
       elif self.CP.openpilotLongitudinalControl:
-        can_sends.append(create_accel_command(self.packer, pcm_accel_cmd, pcm_cancel_cmd, self.standstill_req, lead, CS.acc_type))
+        can_sends.append(create_accel_command(self.packer, pcm_accel_cmd, pcm_cancel_cmd, self.standstill_req, lead, CS.acc_type, CS.gap_adjust_cruise_tr_line, CS.reverse_acc_change))
         self.accel = pcm_accel_cmd
       else:
-        can_sends.append(create_accel_command(self.packer, 0, pcm_cancel_cmd, False, lead, CS.acc_type))
+        can_sends.append(create_accel_command(self.packer, 0, pcm_cancel_cmd, False, lead, CS.acc_type, CS.gap_adjust_cruise_tr_line, CS.reverse_acc_change))
 
     if self.frame % 2 == 0 and self.CP.enableGasInterceptor and self.CP.openpilotLongitudinalControl:
       # send exactly zero if gas cmd is zero. Interceptor will send the max between read value and gas cmd.
@@ -143,10 +163,22 @@ class CarController:
         # forcing the pcm to disengage causes a bad fault sound so play a good sound instead
         send_ui = True
 
-      if self.frame % 20 == 0 or send_ui:
+      use_lta_msg = False
+      if CS.CP.carFingerprint in FEATURES["use_lta_msg"]:
+        use_lta_msg = True
+        if CS.persistLkasIconDisabled == 1:
+          self.has_set_lkas = True
+      else:
+        use_lta_msg = False
+        if CS.persistLkasIconDisabled == 0:
+          self.has_set_lkas = True
+
+      if self.frame % 100 == 0 or send_ui:
+        if not self.has_set_lkas:
+          can_sends.append(create_ui_command_disable_startup_lkas(self.packer, use_lta_msg))
         can_sends.append(create_ui_command(self.packer, steer_alert, pcm_cancel_cmd, hud_control.leftLaneVisible,
                                            hud_control.rightLaneVisible, hud_control.leftLaneDepart,
-                                           hud_control.rightLaneDepart, CC.enabled, CS.lkas_hud))
+                                           hud_control.rightLaneDepart, CC.latActive, CS.lkas_hud, CS.madsEnabled, use_lta_msg, e2e_long_chime))
 
       if (self.frame % 100 == 0 or send_ui) and self.CP.enableDsu:
         can_sends.append(create_fcw_command(self.packer, fcw_alert))

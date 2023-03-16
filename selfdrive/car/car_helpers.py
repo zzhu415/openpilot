@@ -1,14 +1,17 @@
 import os
+import requests
+import threading
+import time
 from typing import Dict, List
 
 from cereal import car
 from common.params import Params
 from common.basedir import BASEDIR
-from system.version import is_comma_remote, is_tested_branch
 from selfdrive.car.interfaces import get_interface_attr
 from selfdrive.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
 from selfdrive.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
-from selfdrive.car.fw_versions import disable_obd_multiplexing, get_fw_versions_ordered, match_fw_to_car, get_present_ecus
+from selfdrive.car.fw_versions import get_fw_versions_ordered, match_fw_to_car, get_present_ecus
+import selfdrive.sentry as sentry
 from system.swaglog import cloudlog
 import cereal.messaging as messaging
 from selfdrive.car import gen_empty_fingerprint
@@ -17,10 +20,7 @@ EventName = car.CarEvent.EventName
 
 
 def get_startup_event(car_recognized, controller_available, fw_seen):
-  if is_comma_remote() and is_tested_branch():
-    event = EventName.startup
-  else:
-    event = EventName.startupMaster
+  event = EventName.startup
 
   if not car_recognized:
     if fw_seen:
@@ -99,7 +99,7 @@ def fingerprint(logcan, sendcan, num_pandas):
     else:
       cloudlog.warning("Getting VIN & FW versions")
       vin_rx_addr, vin = get_vin(logcan, sendcan, bus)
-      ecu_rx_addrs = get_present_ecus(logcan, sendcan, num_pandas=num_pandas)
+      ecu_rx_addrs = get_present_ecus(logcan, sendcan)
       car_fw = get_fw_versions_ordered(logcan, sendcan, ecu_rx_addrs, num_pandas=num_pandas)
       cached = False
 
@@ -113,10 +113,7 @@ def fingerprint(logcan, sendcan, num_pandas):
     cloudlog.event("Malformed VIN", vin=vin, error=True)
     vin = VIN_UNKNOWN
   cloudlog.warning("VIN %s", vin)
-
-  params = Params()
-  params.put("CarVin", vin)
-  disable_obd_multiplexing(params)
+  Params().put("CarVin", vin)
 
   finger = gen_empty_fingerprint()
   candidate_cars = {i: all_legacy_fingerprint_cars() for i in [0, 1]}  # attempt fingerprint on both bus 0 and 1
@@ -176,15 +173,61 @@ def fingerprint(logcan, sendcan, num_pandas):
   return car_fingerprint, finger, vin, car_fw, source, exact_match
 
 
-def get_car(logcan, sendcan, experimental_long_allowed, num_pandas=1):
+def is_connected_to_internet(timeout=5):
+  try:
+    requests.get("https://sentry.io", timeout=timeout)
+    return True
+  except Exception:
+    return False
+
+
+def crash_log(candidate):
+  no_internet = 0
+  while True:
+    if is_connected_to_internet():
+      sentry.capture_warning("fingerprinted %s" % candidate)
+      break
+    else:
+      no_internet += 1
+      if no_internet >= 2:
+        break
+      time.sleep(600)
+
+
+def crash_log2(fingerprints, fw):
+  no_internet = 0
+  while True:
+    if is_connected_to_internet():
+      sentry.capture_warning("car doesn't match any fingerprints: %s" % fingerprints)
+      sentry.capture_warning("car doesn't match any fw: %s" % fw)
+      break
+    else:
+      no_internet += 1
+      if no_internet >= 2:
+        break
+      time.sleep(600)
+
+
+def get_car(logcan, sendcan, num_pandas=1):
   candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(logcan, sendcan, num_pandas)
 
+  if Params().get("CarModel") is not None:
+    car_model = Params().get("CarModel")
+    candidate = car_model.decode("utf-8")
+
   if candidate is None:
-    cloudlog.event("car doesn't match any fingerprints", fingerprints=fingerprints, error=True)
+    cloudlog.warning("car doesn't match any fingerprints: %r", fingerprints)
     candidate = "mock"
+    y = threading.Thread(target=crash_log2, args=(fingerprints, car_fw,))
+    y.start()
+
+  x = threading.Thread(target=crash_log, args=(candidate,))
+  x.start()
+
+  experimental_long = Params().get_bool("ExperimentalLongitudinalEnabled")
 
   CarInterface, CarController, CarState = interfaces[candidate]
-  CP = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long_allowed)
+  CP = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long)
   CP.carVin = vin
   CP.carFw = car_fw
   CP.fingerprintSource = source

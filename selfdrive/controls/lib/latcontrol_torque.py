@@ -2,7 +2,9 @@ import math
 
 from cereal import log
 from common.numpy_fast import interp
-from selfdrive.controls.lib.latcontrol import LatControl
+from common.params import Params
+from decimal import Decimal
+from selfdrive.controls.lib.latcontrol import LatControl, MIN_STEER_SPEED
 from selfdrive.controls.lib.pid import PIDController
 from selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
@@ -31,15 +33,37 @@ class LatControlTorque(LatControl):
     self.use_steering_angle = self.torque_params.useSteeringAngle
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
 
+    self.params = Params()
+    self._torque_max_lat_accel = 0
+    self._torque_friction = 0
+    self.frame = 0
+    self.custom_torque = False
+    self.custom_torque_timer = 0
+
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
     self.torque_params.friction = friction
 
+  def live_tune(self):
+    self.frame += 1
+    if self.frame % 300 == 0:
+      self._torque_max_lat_accel = float(Decimal(self.params.get("TorqueMaxLatAccel", encoding="utf8")) * Decimal('0.01'))
+      self._torque_friction = float(Decimal(self.params.get("TorqueFriction", encoding="utf8")) * Decimal('0.01'))
+      self.torque_params.latAccelFactor = self._torque_max_lat_accel
+      self.torque_params.friction = self._torque_friction
+      self.frame = 0
+
   def update(self, active, CS, VM, params, last_actuators, steer_limited, desired_curvature, desired_curvature_rate, llk):
+    self.custom_torque_timer += 1
+    if self.custom_torque_timer > 100:
+      self.custom_torque_timer = 0
+      self.custom_torque = self.params.get_bool("CustomTorqueLateral")
+    if self.custom_torque:
+      self.live_tune()
     pid_log = log.ControlsState.LateralTorqueState.new_message()
 
-    if not active:
+    if CS.vEgo < MIN_STEER_SPEED or not active:
       output_torque = 0.0
       pid_log.active = False
     else:

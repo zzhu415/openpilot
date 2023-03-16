@@ -1,10 +1,14 @@
 import numpy as np
 from cereal import car
 from common.conversions import Conversions as CV
+from common.params import Params
 from selfdrive.car.interfaces import CarStateBase
 from opendbc.can.parser import CANParser
 from selfdrive.car.volkswagen.values import DBC, CANBUS, PQ_CARS, NetworkLocation, TransmissionType, GearShifter, \
-                                            CarControllerParams
+                                            CarControllerParams, BUTTON_STATES
+from selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
+
+ButtonType = car.CarState.ButtonEvent.Type
 
 
 class CarState(CarStateBase):
@@ -14,6 +18,28 @@ class CarState(CarStateBase):
     self.button_states = {button.event_type: False for button in self.CCP.BUTTONS}
     self.esp_hold_confirmation = False
     self.upscale_lead_car_signal = False
+    self.buttonStates = BUTTON_STATES.copy()
+    self.buttonStatesPrev = BUTTON_STATES.copy()
+
+    self.param_s = Params()
+    self.enable_mads = self.param_s.get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = self.param_s.get_bool("DisengageLateralOnBrake")
+    self.acc_mads_combo = self.param_s.get_bool("AccMadsCombo")
+    self.below_speed_pause = self.param_s.get_bool("BelowSpeedPause")
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
+    self.accEnabled = False
+    self.madsEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+    self.mads_enabled = False
+    self.prev_mads_enabled = False
+    self.cruiseState_enabled = False
+    self.prev_cruiseState_enabled = False
+    self.prev_acc_mads_combo = False
+    self.prev_brake_pressed = False
+    self.resumeAllowed = False
 
   def create_button_events(self, pt_cp, buttons):
     button_events = []
@@ -34,6 +60,12 @@ class CarState(CarStateBase):
       return self.update_pq(pt_cp, cam_cp, ext_cp, trans_type)
 
     ret = car.CarState.new_message()
+
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_cruiseState_enabled = self.cruiseState_enabled
+    self.buttonStatesPrev = self.buttonStates.copy()
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
+
     # Update vehicle speed and acceleration from ABS wheel speeds.
     ret.wheelSpeeds = self.get_wheel_speeds(
       pt_cp.vl["ESP_19"]["ESP_VL_Radgeschw_02"],
@@ -44,7 +76,7 @@ class CarState(CarStateBase):
 
     ret.vEgoRaw = float(np.mean([ret.wheelSpeeds.fl, ret.wheelSpeeds.fr, ret.wheelSpeeds.rl, ret.wheelSpeeds.rr]))
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
-    ret.standstill = ret.vEgoRaw == 0
+    ret.standstill = ret.vEgo < 0.1
 
     # Update steering angle, rate, yaw rate, and driver input torque. VW send
     # the sign/direction in a separate signal so they must be recombined.
@@ -54,11 +86,6 @@ class CarState(CarStateBase):
     ret.steeringPressed = abs(ret.steeringTorque) > self.CCP.STEER_DRIVER_ALLOWANCE
     ret.yawRate = pt_cp.vl["ESP_02"]["ESP_Gierrate"] * (1, -1)[int(pt_cp.vl["ESP_02"]["ESP_VZ_Gierrate"])] * CV.DEG_TO_RAD
 
-    # Verify EPS readiness to accept steering commands
-    hca_status = self.CCP.hca_status_values.get(pt_cp.vl["LH_EPS_03"]["EPS_HCA_Status"])
-    ret.steerFaultPermanent = hca_status in ("DISABLED", "FAULT")
-    ret.steerFaultTemporary = hca_status in ("INITIALIZING", "REJECTED")
-
     # Update gas, brakes, and gearshift.
     ret.gas = pt_cp.vl["Motor_20"]["MO_Fahrpedalrohwert_01"] / 100.0
     ret.gasPressed = ret.gas > 0
@@ -67,6 +94,7 @@ class CarState(CarStateBase):
     brake_pressure_detected = bool(pt_cp.vl["ESP_05"]["ESP_Fahrer_bremst"])
     ret.brakePressed = brake_pedal_pressed or brake_pressure_detected
     ret.parkingBrake = bool(pt_cp.vl["Kombi_01"]["KBI_Handbremse"])  # FIXME: need to include an EPB check as well
+    ret.brakeLights = bool(ret.brakePressed or ret.parkingBrake)
 
     # Update gear and/or clutch position data.
     if trans_type == TransmissionType.automatic:
@@ -96,6 +124,8 @@ class CarState(CarStateBase):
       ret.leftBlindspot = bool(ext_cp.vl["SWA_01"]["SWA_Infostufe_SWA_li"]) or bool(ext_cp.vl["SWA_01"]["SWA_Warnung_SWA_li"])
       ret.rightBlindspot = bool(ext_cp.vl["SWA_01"]["SWA_Infostufe_SWA_re"]) or bool(ext_cp.vl["SWA_01"]["SWA_Warnung_SWA_re"])
 
+    self.belowLaneChangeSpeed = ret.vEgo < LANE_CHANGE_SPEED_MIN and self.below_speed_pause
+
     # Consume factory LDW data relevant for factory SWA (Lane Change Assist)
     # and capture it for forwarding to the blind spot radar controller
     self.ldw_stock_values = cam_cp.vl["LDW_02"] if self.CP.networkLocation == NetworkLocation.fwdCamera else {}
@@ -122,9 +152,12 @@ class CarState(CarStateBase):
       # ACC okay but disabled (1), or a radar visibility or other fault/disruption (6 or 7)
       ret.cruiseState.available = False
       ret.cruiseState.enabled = False
+    self.cruiseState_enabled = ret.cruiseState.enabled
     self.esp_hold_confirmation = bool(pt_cp.vl["ESP_21"]["ESP_Haltebestaetigung"])
     ret.cruiseState.standstill = self.CP.pcmCruise and self.esp_hold_confirmation
     ret.accFaulted = pt_cp.vl["TSK_06"]["TSK_Status"] in (6, 7)
+
+    self.mads_enabled = ret.cruiseState.available
 
     # Update ACC setpoint. When the setpoint is zero or there's an error, the
     # radar sends a set-speed of ~90.69 m/s / 203mph.
@@ -133,11 +166,82 @@ class CarState(CarStateBase):
       if ret.cruiseState.speed > 90:
         ret.cruiseState.speed = 0
 
+    # Update control button states for turn signals and ACC controls.
+    self.buttonStates["accelCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Hoch"])
+    self.buttonStates["decelCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Runter"])
+    self.buttonStates["cancel"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Abbrechen"])
+    self.buttonStates["setCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Setzen"])
+    self.buttonStates["resumeCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Wiederaufnahme"])
+    self.buttonStates["gapAdjustCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Verstellung_Zeitluecke"])
+
     # Update button states for turn signals and ACC controls, capture all ACC button state/config for passthrough
     ret.leftBlinker = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Left"])
     ret.rightBlinker = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Right"])
     ret.buttonEvents = self.create_button_events(pt_cp, self.CCP.BUTTONS)
+    self.button_events = ret.buttonEvents
     self.gra_stock_values = pt_cp.vl["GRA_ACC_01"]
+
+    self.leftBlinkerOn = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Left"])
+    self.rightBlinkerOn = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Right"])
+
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+        if any(b.type in (ButtonType.setCruise, ButtonType.decelCruise) and not b.pressed for b in self.button_events):
+          self.accEnabled = True
+        elif any(b.type in (ButtonType.resumeCruise, ButtonType.accelCruise) and not b.pressed for b in self.button_events) and self.resumeAllowed:
+          self.accEnabled = True
+      if self.enable_mads:
+        self.madsEnabled = True if self.mads_enabled else False
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and (ret.cruiseState.enabled or self.accEnabled):
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled or self.accEnabled
+    else:
+      self.madsEnabled = False
+      self.accEnabled = False
+      self.resumeAllowed = False
+
+    ret.endToEndLong = self.e2eLongStatus
+
+    if not self.CP.pcmCruise or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.CP.pcmCruiseSpeed:
+      if any(b.type == ButtonType.accelCruise and b.pressed for b in self.button_events): # CANCEL
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+      if ret.brakePressed and (not self.prev_brake_pressed or not ret.standstill):
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0 and self.CP.pcmCruiseSpeed:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+      elif not ret.cruiseState.enabled and self.prev_cruiseState_enabled:
+        self.madsEnabled = False
+    self.prev_brake_pressed = ret.brakePressed
+
+    if ret.cruiseState.enabled:
+      self.resumeAllowed = True
+
+    # Verify EPS readiness to accept steering commands
+    hca_status = self.CCP.hca_status_values.get(pt_cp.vl["LH_EPS_03"]["EPS_HCA_Status"])
+
+    ret.steerFaultPermanent = False
+    ret.steerFaultTemporary = False
+
+    if self.madsEnabled:
+      if (not self.belowLaneChangeSpeed and (self.leftBlinkerOn or self.rightBlinkerOn)) or\
+        not (self.leftBlinkerOn or self.rightBlinkerOn):
+        ret.steerFaultPermanent = hca_status in ("DISABLED", "FAULT")
+        ret.steerFaultTemporary = hca_status in ("INITIALIZING", "REJECTED")
 
     # Additional safety checks performed in CarInterface.
     ret.espDisabled = pt_cp.vl["ESP_21"]["ESP_Tastung_passiv"] != 0
@@ -149,6 +253,12 @@ class CarState(CarStateBase):
 
   def update_pq(self, pt_cp, cam_cp, ext_cp, trans_type):
     ret = car.CarState.new_message()
+
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_cruiseState_enabled = self.cruiseState_enabled
+    self.buttonStatesPrev = self.buttonStates.copy()
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
+
     # Update vehicle speed and acceleration from ABS wheel speeds.
     ret.wheelSpeeds = self.get_wheel_speeds(
       pt_cp.vl["Bremse_3"]["Radgeschw__VL_4_1"],
@@ -160,7 +270,7 @@ class CarState(CarStateBase):
     # vEgo obtained from Bremse_1 vehicle speed rather than Bremse_3 wheel speeds because Bremse_3 isn't present on NSF
     ret.vEgoRaw = pt_cp.vl["Bremse_1"]["Geschwindigkeit_neu__Bremse_1_"] * CV.KPH_TO_MS
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
-    ret.standstill = ret.vEgoRaw == 0
+    ret.standstill = ret.vEgo < 0.1
 
     # Update steering angle, rate, yaw rate, and driver input torque. VW send
     # the sign/direction in a separate signal so they must be recombined.
@@ -169,11 +279,6 @@ class CarState(CarStateBase):
     ret.steeringTorque = pt_cp.vl["Lenkhilfe_3"]["LH3_LM"] * (1, -1)[int(pt_cp.vl["Lenkhilfe_3"]["LH3_LMSign"])]
     ret.steeringPressed = abs(ret.steeringTorque) > self.CCP.STEER_DRIVER_ALLOWANCE
     ret.yawRate = pt_cp.vl["Bremse_5"]["Giergeschwindigkeit"] * (1, -1)[int(pt_cp.vl["Bremse_5"]["Vorzeichen_der_Giergeschwindigk"])] * CV.DEG_TO_RAD
-
-    # Verify EPS readiness to accept steering commands
-    hca_status = self.CCP.hca_status_values.get(pt_cp.vl["Lenkhilfe_2"]["LH2_Sta_HCA"])
-    ret.steerFaultPermanent = hca_status in ("DISABLED", "FAULT")
-    ret.steerFaultTemporary = hca_status in ("INITIALIZING", "REJECTED")
 
     # Update gas, brakes, and gearshift.
     ret.gas = pt_cp.vl["Motor_3"]["Fahrpedal_Rohsignal"] / 100.0
@@ -209,6 +314,8 @@ class CarState(CarStateBase):
       ret.leftBlindspot = bool(ext_cp.vl["SWA_1"]["SWA_Infostufe_SWA_li"]) or bool(ext_cp.vl["SWA_1"]["SWA_Warnung_SWA_li"])
       ret.rightBlindspot = bool(ext_cp.vl["SWA_1"]["SWA_Infostufe_SWA_re"]) or bool(ext_cp.vl["SWA_1"]["SWA_Warnung_SWA_re"])
 
+    self.belowLaneChangeSpeed = ret.vEgo < LANE_CHANGE_SPEED_MIN and self.below_speed_pause
+
     # Consume factory LDW data relevant for factory SWA (Lane Change Assist)
     # and capture it for forwarding to the blind spot radar controller
     self.ldw_stock_values = cam_cp.vl["LDW_Status"] if self.CP.networkLocation == NetworkLocation.fwdCamera else {}
@@ -226,23 +333,98 @@ class CarState(CarStateBase):
     # Update ACC radar status.
     self.acc_type = ext_cp.vl["ACC_System"]["ACS_Typ_ACC"]
     ret.cruiseState.available = bool(pt_cp.vl["Motor_5"]["GRA_Hauptschalter"])
-    ret.cruiseState.enabled = pt_cp.vl["Motor_2"]["GRA_Status"] in (1, 2)
+    ret.cruiseState.enabled = self.cruiseState_enabled = pt_cp.vl["Motor_2"]["GRA_Status"] in (1, 2)
     if self.CP.pcmCruise:
-      ret.accFaulted = ext_cp.vl["ACC_GRA_Anzeige"]["ACA_StaACC"] in (6, 7)
+      ret.accFaulted = ext_cp.vl["ACC_GRA_Anziege"]["ACA_StaACC"] in (6, 7)
     else:
       ret.accFaulted = pt_cp.vl["Motor_2"]["GRA_Status"] == 3
 
+    self.mads_enabled = ret.cruiseState.available
+
     # Update ACC setpoint. When the setpoint reads as 255, the driver has not
     # yet established an ACC setpoint, so treat it as zero.
-    ret.cruiseState.speed = ext_cp.vl["ACC_GRA_Anzeige"]["ACA_V_Wunsch"] * CV.KPH_TO_MS
+    ret.cruiseState.speed = ext_cp.vl["ACC_GRA_Anziege"]["ACA_V_Wunsch"] * CV.KPH_TO_MS
     if ret.cruiseState.speed > 70:  # 255 kph in m/s == no current setpoint
       ret.cruiseState.speed = 0
+
+    # Update control button states for turn signals and ACC controls.
+    self.buttonStates["accelCruise"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Up_kurz"])
+    self.buttonStates["decelCruise"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Down_kurz"])
+    self.buttonStates["cancel"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Abbrechen"])
+    self.buttonStates["setCruise"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Neu_Setzen"])
+    self.buttonStates["resumeCruise"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Recall"])
+    self.buttonStates["gapAdjustCruise"] = bool(pt_cp.vl["GRA_Neu"]["GRA_Zeitluecke"])
 
     # Update button states for turn signals and ACC controls, capture all ACC button state/config for passthrough
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_stalk(300, pt_cp.vl["Gate_Komf_1"]["GK1_Blinker_li"],
                                                                             pt_cp.vl["Gate_Komf_1"]["GK1_Blinker_re"])
     ret.buttonEvents = self.create_button_events(pt_cp, self.CCP.BUTTONS)
+    self.button_events = ret.buttonEvents
     self.gra_stock_values = pt_cp.vl["GRA_Neu"]
+
+    self.leftBlinkerOn = bool(pt_cp.vl["Gate_Komf_1"]["GK1_Blinker_li"])
+    self.rightBlinkerOn = bool(pt_cp.vl["Gate_Komf_1"]["GK1_Blinker_re"])
+
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+        for b in self.button_events:
+          if b.type in (ButtonType.setCruise, ButtonType.decelCruise) and not b.pressed:
+            self.accEnabled = True
+          elif b.type in (ButtonType.resumeCruise, ButtonType.accelCruise) and not b.pressed and self.resumeAllowed:
+            self.accEnabled = True
+      if self.enable_mads:
+        self.madsEnabled = True if self.mads_enabled else False
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and (ret.cruiseState.enabled or self.accEnabled):
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled or self.accEnabled
+    else:
+      self.madsEnabled = False
+      self.accEnabled = False
+      self.resumeAllowed = False
+
+    ret.endToEndLong = self.e2eLongStatus
+
+    if not self.CP.pcmCruise or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.CP.pcmCruiseSpeed:
+      for b in self.button_events:
+        if b.type == ButtonType.cancel and b.pressed: # CANCEL
+          self.accEnabled = False
+          if not self.enable_mads:
+            self.madsEnabled = False
+      if ret.brakePressed and (not self.prev_brake_pressed or not ret.standstill):
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0 and self.CP.pcmCruiseSpeed:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+      elif not ret.cruiseState.enabled and self.prev_cruiseState_enabled:
+        self.madsEnabled = False
+    self.prev_brake_pressed = ret.brakePressed
+
+    if ret.cruiseState.enabled:
+      self.resumeAllowed = True
+
+    # Verify EPS readiness to accept steering commands
+    hca_status = self.CCP.hca_status_values.get(pt_cp.vl["Lenkhilfe_2"]["LH2_Sta_HCA"])
+
+    ret.steerFaultPermanent = False
+    ret.steerFaultTemporary = False
+
+    if self.madsEnabled:
+      if (not self.belowLaneChangeSpeed and (self.leftBlinkerOn or self.rightBlinkerOn)) or\
+        not (self.leftBlinkerOn or self.rightBlinkerOn):
+        ret.steerFaultPermanent = hca_status in ("DISABLED", "FAULT")
+        ret.steerFaultTemporary = hca_status in ("INITIALIZING", "REJECTED")
 
     # Additional safety checks performed in CarInterface.
     ret.espDisabled = bool(pt_cp.vl["Bremse_1"]["ESP_Passiv_getastet"])
@@ -516,12 +698,12 @@ class PqExtraSignals:
   # Additional signal and message lists for optional or bus-portable controllers
   fwd_radar_signals = [
     ("ACS_Typ_ACC", "ACC_System"),               # Basic vs FtS (no SnG support on PQ)
-    ("ACA_StaACC", "ACC_GRA_Anzeige"),           # ACC drivetrain coordinator status
-    ("ACA_V_Wunsch", "ACC_GRA_Anzeige"),         # ACC set speed
+    ("ACA_StaACC", "ACC_GRA_Anziege"),           # ACC drivetrain coordinator status
+    ("ACA_V_Wunsch", "ACC_GRA_Anziege"),         # ACC set speed
   ]
   fwd_radar_checks = [
     ("ACC_System", 50),                          # From J428 ACC radar control module
-    ("ACC_GRA_Anzeige", 25),                     # From J428 ACC radar control module
+    ("ACC_GRA_Anziege", 25),                     # From J428 ACC radar control module
   ]
   bsm_radar_signals = [
     ("SWA_Infostufe_SWA_li", "SWA_1"),           # Blind spot object info, left

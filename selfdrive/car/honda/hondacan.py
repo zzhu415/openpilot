@@ -102,7 +102,7 @@ def create_bosch_supplemental_1(packer, car_fingerprint):
   return packer.make_can_msg("BOSCH_SUPPLEMENTAL_1", bus, values)
 
 
-def create_ui_commands(packer, CP, enabled, pcm_speed, hud, is_metric, acc_hud, lkas_hud):
+def create_ui_commands(packer, CP, enabled, lat_active, pcm_speed, hud, is_metric, acc_hud, lkas_hud, gap_adjust_cruise_tr, beep, speed_limit_changed, slc_active, e2e_long_chime):
   commands = []
   bus_pt = get_pt_bus(CP.carFingerprint)
   radar_disabled = CP.carFingerprint in (HONDA_BOSCH - HONDA_BOSCH_RADARLESS) and CP.openpilotLongitudinalControl
@@ -112,7 +112,7 @@ def create_ui_commands(packer, CP, enabled, pcm_speed, hud, is_metric, acc_hud, 
     acc_hud_values = {
       'CRUISE_SPEED': hud.v_cruise,
       'ENABLE_MINI_CAR': 1 if enabled else 0,
-      'HUD_DISTANCE': 0,  # max distance setting on display
+      'HUD_DISTANCE': gap_adjust_cruise_tr,  # max distance setting on display
       'IMPERIAL_UNIT': int(not is_metric),
       'HUD_LEAD': 2 if enabled and hud.lead_visible else 1 if enabled else 0,
       'SET_ME_X01_2': 1,
@@ -135,8 +135,9 @@ def create_ui_commands(packer, CP, enabled, pcm_speed, hud, is_metric, acc_hud, 
   lkas_hud_values = {
     'SET_ME_X41': 0x41,
     'STEERING_REQUIRED': hud.steer_required,
-    'SOLID_LANES': hud.lanes_visible,
-    'BEEP': 0,
+    'SOLID_LANES': lat_active,
+    'DASHED_LANES': hud.dashed_lanes,
+    'BEEP': 1 if (slc_active and (beep or speed_limit_changed)) or e2e_long_chime else 0,
   }
 
   if CP.carFingerprint in HONDA_BOSCH_RADARLESS:

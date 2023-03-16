@@ -17,11 +17,14 @@ from system.hardware import HARDWARE, PC
 from selfdrive.manager.helpers import unblock_stdout
 from selfdrive.manager.process import ensure_running
 from selfdrive.manager.process_config import managed_processes
+from selfdrive.sentry import CRASHES_DIR
 from selfdrive.athena.registration import register, UNREGISTERED_DONGLE_ID
 from system.swaglog import cloudlog, add_file_handler
 from system.version import is_dirty, get_commit, get_version, get_origin, get_short_branch, \
-                              terms_version, training_version, is_tested_branch, is_release_branch
+                              terms_version, training_version, is_tested_branch
 
+
+sys.path.append(os.path.join(BASEDIR, "pyextra"))
 
 
 def manager_init() -> None:
@@ -29,18 +32,69 @@ def manager_init() -> None:
   set_time(cloudlog)
 
   # save boot log
-  subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "system/loggerd"))
+  subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "selfdrive/loggerd"))
 
   params = Params()
   params.clear_all(ParamKeyType.CLEAR_ON_MANAGER_START)
 
   default_params: List[Tuple[str, Union[str, bytes]]] = [
+    ("AccMadsCombo", "1"),
+    ("AutoLaneChangeTimer", "0"),
+    ("BelowSpeedPause", "0"),
+    ("BrakeLights", "0"),
+    ("BrightnessControl", "0"),
+    ("CustomTorqueLateral", "0"),
+    ("CameraControl", "2"),
+    ("CameraControlToggle", "0"),
+    ("CameraOffset", "0"),
+    ("CarModel", ""),
+    ("CarModelText", ""),
+    ("ChevronInfo", "1"),
+    ("CustomBootScreen", "0"),
+    ("CustomOffsets", "0"),
     ("CompletedTrainingVersion", "0"),
+    ("DevUI", "1"),
+    ("DevUIRow", "1"),
+    ("DisableOnroadUploads", "0"),
+    ("DisengageLateralOnBrake", "1"),
     ("DisengageOnAccelerator", "0"),
+    ("DynamicLaneProfile", "2"),
+    ("DynamicLaneProfileToggle", "1"),
+    ("EnableMads", "1"),
+    ("EndToEndLongAlert", "0"),
+    ("EndToEndLongToggle", "1"),
+    ("EnhancedScc", "0"),
+    ("GapAdjustCruise", "1"),
+    ("GapAdjustCruiseMode", "0"),
+    ("GapAdjustCruiseTr", "4"),
+    ("GpxDeleteAfterUpload", "1"),
+    ("GpxDeleteIfUploaded", "1"),
     ("GsmMetered", "1"),
+    ("HandsOnWheelMonitoring", "0"),
     ("HasAcceptedTerms", "0"),
     ("LanguageSetting", "main_en"),
+    ("LastSpeedLimitSignTap", "0"),
+    ("MadsIconToggle", "1"),
+    ("MaxTimeOffroad", "9"),
+    ("OnroadScreenOff", "0"),
+    ("OnroadScreenOffBrightness", "50"),
     ("OpenpilotEnabledToggle", "1"),
+    ("PathOffset", "0"),
+    ("ReverseAccChange", "0"),
+    ("ShowDebugUI", "1"),
+    ("SpeedLimitControl", "1"),
+    ("SpeedLimitPercOffset", "1"),
+    ("SpeedLimitStyle", "0"),
+    ("SpeedLimitValueOffset", "0"),
+    ("StandStillTimer", "0"),
+    ("StockLongToyota", "0"),
+    ("TorqueDeadzoneDeg", "0"),
+    ("TorqueFriction", "1"),
+    ("TorqueMaxLatAccel", "250"),
+    ("TurnSpeedControl", "0"),
+    ("TurnVisionControl", "0"),
+    ("VisionCurveLaneless", "0"),
+    ("VwAccType", "0"),
   ]
   if not PC:
     default_params.append(("LastUpdateTime", datetime.datetime.utcnow().isoformat().encode('utf8')))
@@ -76,7 +130,6 @@ def manager_init() -> None:
   params.put("GitBranch", get_short_branch(default=""))
   params.put("GitRemote", get_origin(default=""))
   params.put_bool("IsTestedBranch", is_tested_branch())
-  params.put_bool("IsReleaseBranch", is_release_branch())
 
   # set dongle id
   reg_res = register(show_spinner=True)
@@ -94,6 +147,9 @@ def manager_init() -> None:
   sentry.init(sentry.SentryProject.SELFDRIVE)
   cloudlog.bind_global(dongle_id=dongle_id, version=get_version(), dirty=is_dirty(),
                        device=HARDWARE.get_device_type())
+
+  if os.path.isfile(f'{CRASHES_DIR}/error.txt'):
+    os.remove(f'{CRASHES_DIR}/error.txt')
 
 
 def manager_prepare() -> None:

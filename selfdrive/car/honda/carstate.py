@@ -3,11 +3,13 @@ from collections import defaultdict
 from cereal import car
 from common.conversions import Conversions as CV
 from common.numpy_fast import interp
+from common.params import Params
 from opendbc.can.can_define import CANDefine
 from opendbc.can.parser import CANParser
 from selfdrive.car.honda.hondacan import get_pt_bus
 from selfdrive.car.honda.values import CAR, DBC, STEER_THRESHOLD, HONDA_BOSCH, HONDA_NIDEC_ALT_SCM_MESSAGES, HONDA_BOSCH_ALT_BRAKE_SIGNAL, HONDA_BOSCH_RADARLESS
 from selfdrive.car.interfaces import CarStateBase
+from selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
 
 TransmissionType = car.CarParams.TransmissionType
 
@@ -89,6 +91,7 @@ def get_can_signals(CP, gearbox_msg, main_on_sig_msg):
         ("CRUISE_SPEED", "ACC_HUD"),
         ("ACCEL_COMMAND", "ACC_CONTROL"),
         ("AEB_STATUS", "ACC_CONTROL"),
+        ("BRAKE_LIGHTS", "ACC_CONTROL"),
       ]
       checks += [
         ("ACC_HUD", 10),
@@ -155,6 +158,30 @@ class CarState(CarStateBase):
     # However, on cars without a digital speedometer this is not always present (HRV, FIT, CRV 2016, ILX and RDX)
     self.dash_speed_seen = False
 
+    self.param_s = Params()
+    self.enable_mads = self.param_s.get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = self.param_s.get_bool("DisengageLateralOnBrake")
+    self.acc_mads_combo = self.param_s.get_bool("AccMadsCombo")
+    self.below_speed_pause = self.param_s.get_bool("BelowSpeedPause")
+    self.accEnabled = False
+    self.madsEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+    self.mads_enabled = False
+    self.prev_mads_enabled = False
+    self.cruiseState_enabled = False
+    self.prev_cruiseState_enabled = False
+    self.prev_acc_mads_combo = False
+    self.prev_brake_pressed = False
+    self.gap_adjust_cruise_tr = 0
+    self.gap_adjust_cruise_counter = 0.
+    self.e2e_long_hold_counter = 0.
+    self.e2e_long_hold_gap = False
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
+    self.resumeAllowed = False
+
   def update(self, cp, cp_cam, cp_body):
     ret = car.CarState.new_message()
 
@@ -165,6 +192,12 @@ class CarState(CarStateBase):
     # update prevs, update must run once per loop
     self.prev_cruise_buttons = self.cruise_buttons
     self.prev_cruise_setting = self.cruise_setting
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_cruiseState_enabled = self.cruiseState_enabled
+    self.gap_adjust_cruise = self.param_s.get_bool("GapAdjustCruise")
+    self.gap_adjust_cruise_mode = int(self.param_s.get("GapAdjustCruiseMode"))
+    self.gap_adjust_cruise_tr = int(self.param_s.get("GapAdjustCruiseTr"))
+    self.e2eLongStatus = self.param_s.get_bool("ExperimentalMode")
     self.cruise_setting = cp.vl["SCM_BUTTONS"]["CRUISE_SETTING"]
     self.cruise_buttons = cp.vl["SCM_BUTTONS"]["CRUISE_BUTTONS"]
 
@@ -184,12 +217,6 @@ class CarState(CarStateBase):
       ret.doorOpen = any([cp.vl["DOORS_STATUS"]["DOOR_OPEN_FL"], cp.vl["DOORS_STATUS"]["DOOR_OPEN_FR"],
                           cp.vl["DOORS_STATUS"]["DOOR_OPEN_RL"], cp.vl["DOORS_STATUS"]["DOOR_OPEN_RR"]])
     ret.seatbeltUnlatched = bool(cp.vl["SEATBELT_STATUS"]["SEATBELT_DRIVER_LAMP"] or not cp.vl["SEATBELT_STATUS"]["SEATBELT_DRIVER_LATCHED"])
-
-    steer_status = self.steer_status_values[cp.vl["STEER_STATUS"]["STEER_STATUS"]]
-    ret.steerFaultPermanent = steer_status not in ("NORMAL", "NO_TORQUE_ALERT_1", "NO_TORQUE_ALERT_2", "LOW_SPEED_LOCKOUT", "TMP_FAULT")
-    # LOW_SPEED_LOCKOUT is not worth a warning
-    # NO_TORQUE_ALERT_2 can be caused by bump or steering nudge from driver
-    ret.steerFaultTemporary = steer_status not in ("NORMAL", "LOW_SPEED_LOCKOUT", "NO_TORQUE_ALERT_2")
 
     if self.CP.openpilotLongitudinalControl:
       self.brake_error = cp.vl["STANDSTILL"]["BRAKE_ERROR_1"] or cp.vl["STANDSTILL"]["BRAKE_ERROR_2"]
@@ -213,12 +240,17 @@ class CarState(CarStateBase):
       conversion = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
       ret.vEgoCluster = cp.vl["CAR_SPEED"]["ROUGH_CAR_SPEED_2"] * conversion
 
+    self.belowLaneChangeSpeed = ret.vEgo < LANE_CHANGE_SPEED_MIN and self.below_speed_pause
+
     ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEER_ANGLE"]
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEER_ANGLE_RATE"]
 
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_stalk(
       250, cp.vl["SCM_FEEDBACK"]["LEFT_BLINKER"], cp.vl["SCM_FEEDBACK"]["RIGHT_BLINKER"])
     ret.brakeHoldActive = cp.vl["VSA_STATUS"]["BRAKE_HOLD_ACTIVE"] == 1
+
+    self.leftBlinkerOn = cp.vl["SCM_FEEDBACK"]["LEFT_BLINKER"] != 0
+    self.rightBlinkerOn = cp.vl["SCM_FEEDBACK"]["RIGHT_BLINKER"] != 0
 
     # TODO: set for all cars
     if self.CP.carFingerprint in (HONDA_BOSCH | {CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN}):
@@ -270,13 +302,120 @@ class CarState(CarStateBase):
       ret.brakePressed = (cp.vl["POWERTRAIN_DATA"]["BRAKE_PRESSED"] != 0) or self.brake_switch_active
 
     ret.brake = cp.vl["VSA_STATUS"]["USER_BRAKE"]
-    ret.cruiseState.enabled = cp.vl["POWERTRAIN_DATA"]["ACC_STATUS"] != 0
+    ret.cruiseState.enabled = self.cruiseState_enabled = cp.vl["POWERTRAIN_DATA"]["ACC_STATUS"] != 0
     ret.cruiseState.available = bool(cp.vl[self.main_on_sig_msg]["MAIN_ON"])
 
+    self.mads_enabled = ret.cruiseState.available
+
     # Gets rid of Pedal Grinding noise when brake is pressed at slow speeds for some models
-    if self.CP.carFingerprint in (CAR.PILOT, CAR.RIDGELINE):
+    if self.CP.carFingerprint in (CAR.PILOT, CAR.PASSPORT, CAR.RIDGELINE):
       if ret.brake > 0.1:
         ret.brakePressed = True
+
+    if self.CP.carFingerprint in (CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN, CAR.CRV_5G, CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH,
+                                    CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E):
+      ret.brakeLights = bool(ret.brakePressed or cp.vl["ACC_CONTROL"]['BRAKE_LIGHTS'] != 0 or ret.brake > 0.4 or ret.parkingBrake) if not self.CP.openpilotLongitudinalControl else \
+                         bool(ret.brakePressed or ret.brake > 0.4 or ret.parkingBrake)
+    elif self.CP.carFingerprint in HONDA_BOSCH and self.CP.carFingerprint not in (CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN, CAR.CRV_5G, CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH,
+                                    CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E) and self.CP.carFingerprint not in HONDA_BOSCH_RADARLESS:
+      ret.brakeLights = bool(ret.brakePressed or cp.vl["ACC_CONTROL"]['BRAKE_LIGHTS'] != 0 or ret.brake > 0.4) if not self.CP.openpilotLongitudinalControl else \
+                         bool(ret.brakePressed or ret.brake > 0.4)
+    else:
+      ret.brakeLights = bool(ret.brakePressed)
+
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+        if self.prev_cruise_buttons == 3:  # SET-
+          if self.cruise_buttons != 3:
+            self.accEnabled = True
+        elif self.prev_cruise_buttons == 4 and self.resumeAllowed:  # RESUME+
+          if self.cruise_buttons != 4:
+            self.accEnabled = True
+      if self.CP.openpilotLongitudinalControl:
+        if self.gap_adjust_cruise:
+          if self.gap_adjust_cruise_mode in (0, 2):
+            if self.cruise_setting == 3:  # DISTANCE_ADJ
+              self.gap_adjust_cruise_counter += 1
+            elif self.prev_cruise_setting == 3 and self.cruise_setting != 3 and self.gap_adjust_cruise_counter < 50:  # DISTANCE_ADJ
+              self.gap_adjust_cruise_counter = 0
+              self.gap_adjust_cruise_tr -= 1
+              if self.gap_adjust_cruise_tr < 0:
+                self.gap_adjust_cruise_tr = 3
+              self.param_s.put("GapAdjustCruiseTr", str(self.gap_adjust_cruise_tr))
+            else:
+              self.gap_adjust_cruise_counter = 0
+        else:
+          self.gap_adjust_cruise_tr = 0
+        if self.cruise_setting == 3:
+          self.e2e_long_hold_counter += 1
+          if self.e2e_long_hold_counter > 50 and not self.e2e_long_hold_gap:
+            self.e2e_long_hold_counter = 0
+            self.e2e_long_hold_gap = True
+            self.e2eLongStatus = not self.e2eLongStatus
+            self.param_s.put_bool("ExperimentalMode", self.e2eLongStatus)
+        else:
+          self.e2e_long_hold_counter = 0
+          self.e2e_long_hold_gap = False
+      if self.enable_mads:
+        if not self.prev_mads_enabled and self.mads_enabled:
+          self.madsEnabled = True
+        if self.prev_cruise_setting != 1 and self.cruise_setting == 1:
+          self.madsEnabled = not self.madsEnabled
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and (ret.cruiseState.enabled or self.accEnabled):
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled or self.accEnabled
+    else:
+      self.madsEnabled = False
+      self.accEnabled = False
+      self.e2e_long_hold_counter = 0
+      self.e2e_long_hold_gap = False
+      self.gap_adjust_cruise_counter = 0
+      self.resumeAllowed = False
+
+    ret.gapAdjustCruiseTr = self.gap_adjust_cruise_tr
+    ret.endToEndLong = self.e2eLongStatus
+
+    if not self.CP.pcmCruise or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.CP.pcmCruiseSpeed:
+      if self.prev_cruise_buttons != 2:  # CANCEL
+        if self.cruise_buttons == 2:
+          self.accEnabled = False
+          if not self.enable_mads:
+            self.madsEnabled = False
+      if ret.brakePressed and (not self.prev_brake_pressed or not ret.standstill):
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0 and self.CP.pcmCruiseSpeed:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+      elif not ret.cruiseState.enabled and self.prev_cruiseState_enabled:
+        self.madsEnabled = False
+    self.prev_brake_pressed = ret.brakePressed
+
+    if ret.cruiseState.enabled:
+      self.resumeAllowed = True
+
+    ret.steerFaultPermanent = False
+    ret.steerFaultTemporary = False
+
+    if self.madsEnabled:
+      steer_status = self.steer_status_values[cp.vl["STEER_STATUS"]["STEER_STATUS"]]
+      ret.steerFaultPermanent = steer_status not in ("NORMAL", "NO_TORQUE_ALERT_1", "NO_TORQUE_ALERT_2", "LOW_SPEED_LOCKOUT", "TMP_FAULT")
+      if (not self.belowLaneChangeSpeed and (ret.leftBlinker or ret.rightBlinker)) or \
+        not (ret.leftBlinker or ret.rightBlinker):
+        # LOW_SPEED_LOCKOUT is not worth a warning
+        # NO_TORQUE_ALERT_2 can be caused by bump or steering nudge from driver
+        ret.steerFaultTemporary = steer_status not in ("NORMAL", "LOW_SPEED_LOCKOUT", "NO_TORQUE_ALERT_2")
 
     if self.CP.carFingerprint in HONDA_BOSCH:
       # TODO: find the radarless AEB_STATUS bit and make sure ACCEL_COMMAND is correct to enable AEB alerts

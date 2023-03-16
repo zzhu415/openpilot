@@ -9,7 +9,9 @@ from common.basedir import BASEDIR
 from common.conversions import Conversions as CV
 from common.kalman.simple_kalman import KF1D
 from common.numpy_fast import clip, interp
+from common.params import Params
 from common.realtime import DT_CTRL
+from decimal import Decimal
 from selfdrive.car import apply_hysteresis, gen_empty_fingerprint, scale_rot_inertia, scale_tire_stiffness
 from selfdrive.controls.lib.drive_helpers import V_CRUISE_MAX, apply_center_deadzone
 from selfdrive.controls.lib.events import Events
@@ -67,6 +69,8 @@ class CarInterfaceBase(ABC):
     self.silent_steer_warning = True
     self.v_ego_cluster_seen = False
 
+    self.cruise_cancelled_btn = True
+
     self.CS = None
     self.can_parsers = []
     if CarState is not None:
@@ -83,19 +87,24 @@ class CarInterfaceBase(ABC):
     if CarController is not None:
       self.CC = CarController(self.cp.dbc_name, CP, self.VM)
 
+    self.disengage_on_accelerator = Params().get_bool("DisengageOnAccelerator")
+    self.enable_mads = Params().get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = Params().get_bool("DisengageLateralOnBrake")
+    self.mads_ndlob = self.enable_mads and not self.mads_disengage_lateral_on_brake
+    self.gear_warning = 0
+
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
     return ACCEL_MIN, ACCEL_MAX
 
   @classmethod
-  def get_non_essential_params(cls, candidate: str):
-    """
-    Parameters essential to controlling the car may be incomplete or wrong without FW versions or fingerprints.
-    """
-    return cls.get_params(candidate, gen_empty_fingerprint(), list(), False)
+  def get_params(cls, candidate: str, fingerprint: Optional[Dict[int, Dict[int, int]]] = None, car_fw: Optional[List[car.CarParams.CarFw]] = None, experimental_long: bool = False):
+    if fingerprint is None:
+      fingerprint = gen_empty_fingerprint()
 
-  @classmethod
-  def get_params(cls, candidate: str, fingerprint: Dict[int, Dict[int, int]], car_fw: List[car.CarParams.CarFw], experimental_long: bool):
+    if car_fw is None:
+      car_fw = list()
+
     ret = CarInterfaceBase.get_std_params(candidate)
     ret = cls._get_params(ret, candidate, fingerprint, car_fw, experimental_long)
 
@@ -160,6 +169,7 @@ class CarInterfaceBase(ABC):
     ret.wheelSpeedFactor = 1.0
 
     ret.pcmCruise = True     # openpilot's state is tied to the PCM's cruise state on most cars
+    ret.pcmCruiseSpeed = True  # openpilot's state is tied to the PCM's cruise speed
     ret.minEnableSpeed = -1. # enable is done by stock ACC, so ignore this
     ret.steerRatioRear = 0.  # no rear steering, at least on the listed cars aboveA
     ret.openpilotLongitudinalControl = False
@@ -184,6 +194,9 @@ class CarInterfaceBase(ABC):
   @staticmethod
   def configure_torque_tune(candidate, tune, steering_angle_deadzone_deg=0.0, use_steering_angle=True):
     params = get_torque_params(candidate)
+
+    # torque_max_lat_accel = float(Decimal(Params().get("TorqueMaxLatAccel", encoding="utf8")) * Decimal('0.01'))
+    # torque_friction = float(Decimal(Params().get("TorqueFriction", encoding="utf8")) * Decimal('0.01'))
 
     tune.init('torque')
     tune.torque.useSteeringAngle = use_steering_angle
@@ -233,7 +246,7 @@ class CarInterfaceBase(ABC):
     return reader
 
   @abstractmethod
-  def apply(self, c: car.CarControl, now_nanos: int) -> Tuple[car.CarControl.Actuators, List[bytes]]:
+  def apply(self, c: car.CarControl) -> Tuple[car.CarControl.Actuators, List[bytes]]:
     pass
 
   def create_common_events(self, cs_out, extra_gears=None, pcm_enable=True, allow_enable=True,
@@ -242,13 +255,19 @@ class CarInterfaceBase(ABC):
 
     if cs_out.doorOpen:
       events.add(EventName.doorOpen)
-    if cs_out.seatbeltUnlatched:
+    if cs_out.seatbeltUnlatched and cs_out.gearShifter != GearShifter.park:
       events.add(EventName.seatbeltNotLatched)
-    if cs_out.gearShifter != GearShifter.drive and (extra_gears is None or
-       cs_out.gearShifter not in extra_gears):
-      events.add(EventName.wrongGear)
+    if cs_out.gearShifter != GearShifter.drive and cs_out.gearShifter not in extra_gears and not \
+            (cs_out.gearShifter == GearShifter.unknown and self.gear_warning < int(0.5/DT_CTRL)):
+      if cs_out.vEgo < 5:
+        events.add(EventName.silentWrongGear)
+      else:
+        events.add(EventName.wrongGear)
     if cs_out.gearShifter == GearShifter.reverse:
-      events.add(EventName.reverseGear)
+      if cs_out.vEgo < 5:
+        events.add(EventName.spReverseGear)
+      else:
+        events.add(EventName.reverseGear)
     if not cs_out.cruiseState.available:
       events.add(EventName.wrongCarMode)
     if cs_out.espDisabled:
@@ -262,7 +281,12 @@ class CarInterfaceBase(ABC):
     if cs_out.cruiseState.nonAdaptive:
       events.add(EventName.wrongCruiseMode)
     if cs_out.brakeHoldActive and self.CP.openpilotLongitudinalControl:
-      events.add(EventName.brakeHold)
+      if cs_out.madsEnabled:
+        cs_out.disengageByBrake = True
+      if cs_out.cruiseState.enabled:
+        events.add(EventName.brakeHold)
+      else:
+        events.add(EventName.silentBrakeHold)
     if cs_out.parkingBrake:
       events.add(EventName.parkBrake)
     if cs_out.accFaulted:
@@ -270,14 +294,16 @@ class CarInterfaceBase(ABC):
     if cs_out.steeringPressed:
       events.add(EventName.steerOverride)
 
-    # Handle button presses
-    for b in cs_out.buttonEvents:
-      # Enable OP long on falling edge of enable buttons (defaults to accelCruise and decelCruise, overridable per-port)
-      if not self.CP.pcmCruise and (b.type in enable_buttons and not b.pressed):
-        events.add(EventName.buttonEnable)
-      # Disable on rising and falling edge of cancel for both stock and OP long
-      if b.type == ButtonType.cancel:
-        events.add(EventName.buttonCancel)
+    self.gear_warning = self.gear_warning + 1 if cs_out.gearShifter == GearShifter.unknown else 0
+
+    ## Handle button presses
+    #for b in cs_out.buttonEvents:
+    #  # Enable OP long on falling edge of enable buttons (defaults to accelCruise and decelCruise, overridable per-port)
+    #  if not self.CP.pcmCruise and (b.type in enable_buttons and not b.pressed):
+    #    events.add(EventName.buttonEnable)
+    #  # Disable on rising and falling edge of cancel for both stock and OP long
+    #  if b.type == ButtonType.cancel:
+    #    events.add(EventName.buttonCancel)
 
     # Handle permanent and temporary steering faults
     self.steering_unpressed = 0 if cs_out.steeringPressed else self.steering_unpressed + 1
@@ -292,6 +318,12 @@ class CarInterfaceBase(ABC):
       self.silent_steer_warning = False
     if cs_out.steerFaultPermanent:
       events.add(EventName.steerUnavailable)
+
+    # Disable on rising edge of gas or brake. Also disable on brake when speed > 0.
+    if (cs_out.gasPressed and not self.CS.out.gasPressed and self.disengage_on_accelerator) or \
+       (cs_out.brakePressed and (not self.CS.out.brakePressed or not cs_out.standstill) and not self.mads_ndlob):
+      if cs_out.madsEnabled:
+        cs_out.disengageByBrake = True
 
     # we engage when pcm is active (rising edge)
     # enabling can optionally be blocked by the car interface
@@ -395,21 +427,32 @@ class CarStateBase(ABC):
 
     return bool(left_blinker_stalk or self.left_blinker_cnt > 0), bool(right_blinker_stalk or self.right_blinker_cnt > 0)
 
+  def update_custom_stock_long(self, cruise_button, final_speed_kph, v_cruise_kph_prev, target_speed, v_set_dis, speed_diff, button_type):
+    customStockLong = car.CarState.CustomStockLong.new_message()
+    customStockLong.cruiseButton = 0 if cruise_button is None else cruise_button
+    customStockLong.finalSpeedKph = final_speed_kph
+    customStockLong.vCruiseKphPrev = v_cruise_kph_prev
+    customStockLong.targetSpeed = target_speed
+    customStockLong.vSetDis = v_set_dis
+    customStockLong.speedDiff = speed_diff
+    customStockLong.buttonType = button_type
+    return customStockLong
+
   @staticmethod
   def parse_gear_shifter(gear: Optional[str]) -> car.CarState.GearShifter:
     if gear is None:
       return GearShifter.unknown
 
     d: Dict[str, car.CarState.GearShifter] = {
-      'P': GearShifter.park, 'PARK': GearShifter.park,
-      'R': GearShifter.reverse, 'REVERSE': GearShifter.reverse,
-      'N': GearShifter.neutral, 'NEUTRAL': GearShifter.neutral,
-      'E': GearShifter.eco, 'ECO': GearShifter.eco,
-      'T': GearShifter.manumatic, 'MANUAL': GearShifter.manumatic,
-      'D': GearShifter.drive, 'DRIVE': GearShifter.drive,
-      'S': GearShifter.sport, 'SPORT': GearShifter.sport,
-      'L': GearShifter.low, 'LOW': GearShifter.low,
-      'B': GearShifter.brake, 'BRAKE': GearShifter.brake,
+        'P': GearShifter.park, 'PARK': GearShifter.park,
+        'R': GearShifter.reverse, 'REVERSE': GearShifter.reverse,
+        'N': GearShifter.neutral, 'NEUTRAL': GearShifter.neutral,
+        'E': GearShifter.eco, 'ECO': GearShifter.eco,
+        'T': GearShifter.manumatic, 'MANUAL': GearShifter.manumatic,
+        'D': GearShifter.drive, 'DRIVE': GearShifter.drive,
+        'S': GearShifter.sport, 'SPORT': GearShifter.sport,
+        'L': GearShifter.low, 'LOW': GearShifter.low,
+        'B': GearShifter.brake, 'BRAKE': GearShifter.brake,
     }
     return d.get(gear.upper(), GearShifter.unknown)
 
